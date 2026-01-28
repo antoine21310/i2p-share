@@ -46,6 +46,8 @@ export class TrackerServer extends EventEmitter {
   private peers: Map<string, Peer> = new Map();
   private cleanupTimer: NodeJS.Timeout | null = null;
   private statsInterval: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts: number = 0;
 
   constructor(config: Partial<TrackerConfig> = {}) {
     super();
@@ -157,34 +159,9 @@ export class TrackerServer extends EventEmitter {
       console.log('[Tracker] Destination saved to:', destFile);
 
       // Create RAW session for datagram communication
-      console.log('[Tracker] Creating RAW session...');
-      this.sam = await createRaw({
-        sam: {
-          host: this.config.samHost,
-          portTCP: this.config.samPortTCP,
-          portUDP: this.config.samPortUDP,
-          publicKey: this.publicKey,
-          privateKey: this.privateKey
-        },
-        listen: {
-          address: '127.0.0.1',
-          port: this.config.listenPort
-        }
-      });
+      await this.createSamSession();
 
-      // Set up event handlers
-      this.sam.on('data', (data: Buffer) => {
-        this.handleIncomingData(data);
-      });
-
-      this.sam.on('close', () => {
-        console.log('[Tracker] Session closed');
-        this.isRunning = false;
-      });
-
-      this.sam.on('error', (error: Error) => {
-        console.error('[Tracker] Session error:', error.message);
-      });
+      this.isRunning = true;
 
       // Start cleanup timer
       this.cleanupTimer = setInterval(() => {
@@ -212,6 +189,66 @@ export class TrackerServer extends EventEmitter {
         error: error.message
       };
     }
+  }
+
+  private async createSamSession(): Promise<void> {
+    // Use a random port to avoid conflicts with the main app
+    const listenPort = this.config.listenPort + Math.floor(Math.random() * 100);
+
+    console.log('[Tracker] Creating RAW session on port', listenPort);
+
+    this.sam = await createRaw({
+      sam: {
+        host: this.config.samHost,
+        portTCP: this.config.samPortTCP,
+        portUDP: this.config.samPortUDP,
+        publicKey: this.publicKey,
+        privateKey: this.privateKey
+      },
+      listen: {
+        address: '127.0.0.1',
+        port: listenPort
+      }
+    });
+
+    // Set up event handlers
+    this.sam.on('data', (data: Buffer) => {
+      this.handleIncomingData(data);
+    });
+
+    this.sam.on('close', () => {
+      console.log('[Tracker] Session closed');
+      if (this.isRunning) {
+        this.scheduleReconnect();
+      }
+    });
+
+    this.sam.on('error', (error: Error) => {
+      console.error('[Tracker] Session error:', error.message);
+    });
+
+    this.reconnectAttempts = 0;
+    console.log('[Tracker] RAW session created successfully');
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+
+    this.reconnectAttempts++;
+    const delay = Math.min(5000 * this.reconnectAttempts, 30000);
+
+    console.log(`[Tracker] Reconnecting in ${delay/1000}s (attempt ${this.reconnectAttempts})...`);
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.createSamSession();
+        console.log('[Tracker] Reconnected successfully');
+      } catch (error: any) {
+        console.error('[Tracker] Reconnect failed:', error.message);
+        this.scheduleReconnect();
+      }
+    }, delay);
   }
 
   private handleIncomingData(data: Buffer): void {

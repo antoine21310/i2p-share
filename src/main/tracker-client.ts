@@ -238,9 +238,8 @@ export class TrackerClient extends EventEmitter {
     const tracker = this.getActiveTracker();
     if (!this.sendMessage || !tracker) return;
 
-    // Ensure tracker address has .b32.i2p suffix for SAM lookup
-    const trackerDest = tracker.includes('.b32.i2p') ? tracker : `${tracker}.b32.i2p`;
-
+    // Use the tracker address directly - it should be a full I2P destination
+    // (Full destinations are base64 strings, typically ending in AAAA)
     const message: TrackerMessage = {
       type: 'ANNOUNCE',
       payload: {
@@ -252,8 +251,8 @@ export class TrackerClient extends EventEmitter {
     };
 
     try {
-      await this.sendMessage(trackerDest, message);
-      console.log('[TrackerClient] Announced to tracker:', trackerDest.substring(0, 20) + '...');
+      await this.sendMessage(tracker, message);
+      console.log('[TrackerClient] Announced to tracker:', tracker.substring(0, 20) + '...');
     } catch (error: any) {
       console.error('[TrackerClient] Announce failed:', error.message);
     }
@@ -263,9 +262,7 @@ export class TrackerClient extends EventEmitter {
     const tracker = this.getActiveTracker();
     if (!this.sendMessage || !tracker) return;
 
-    // Ensure tracker address has .b32.i2p suffix for SAM lookup
-    const trackerDest = tracker.includes('.b32.i2p') ? tracker : `${tracker}.b32.i2p`;
-
+    // Use the tracker address directly - it should be a full I2P destination
     const message: TrackerMessage = {
       type: 'GET_PEERS',
       payload: {},
@@ -273,7 +270,7 @@ export class TrackerClient extends EventEmitter {
     };
 
     try {
-      await this.sendMessage(trackerDest, message);
+      await this.sendMessage(tracker, message);
       console.log('[TrackerClient] Requested peer list from tracker');
     } catch (error: any) {
       console.error('[TrackerClient] Request peers failed:', error.message);
@@ -281,12 +278,18 @@ export class TrackerClient extends EventEmitter {
   }
 
   handleMessage(from: string, message: any): boolean {
-    // Convert sender's full destination to b32 for comparison
+    // Check if message is from any of our trackers
+    // Compare both full destinations and b32 addresses
     const fromB32 = toB32(from);
 
-    // Check if message is from any of our trackers (compare b32 addresses)
     const trackerIndex = this.config.trackerAddresses.findIndex(addr => {
-      // Remove .b32.i2p suffix if present for comparison
+      // If configured address is a full destination (long base64 string)
+      if (addr.length > 100 && !addr.includes('.b32.i2p')) {
+        // Compare full destinations directly, or convert to b32
+        const addrB32 = toB32(addr);
+        return addr === from || addrB32 === fromB32;
+      }
+      // If configured address is a b32 address
       const cleanAddr = addr.replace(/\.b32\.i2p$/i, '').toLowerCase();
       const cleanFrom = fromB32.replace(/\.b32\.i2p$/i, '').toLowerCase();
       return cleanAddr === cleanFrom;

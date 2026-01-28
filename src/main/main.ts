@@ -357,12 +357,17 @@ async function connectToTracker(myDestination: string): Promise<void> {
   }
 
   console.log(`[Main] Connecting to trackers (${trackerAddresses.length} configured)...`);
+  console.log(`[Main] My destination (first 50 chars): ${myDestination.substring(0, 50)}...`);
+  console.log(`[Main] Tracker address (first 50 chars): ${trackerAddresses[0]?.substring(0, 50)}...`);
 
   // Set up tracker client with all addresses
   trackerClient.setTrackerAddresses(trackerAddresses);
   trackerClient.setIdentity(myDestination);
   trackerClient.setMessageHandler(async (dest, msg) => {
-    return await i2pConnection.sendMessage(dest, msg);
+    console.log(`[Main] Sending message to ${dest.substring(0, 30)}...: ${msg.type}`);
+    const result = await i2pConnection.sendMessage(dest, msg);
+    console.log(`[Main] Send result: ${result}`);
+    return result;
   });
 
   // Update stats
@@ -600,11 +605,12 @@ app.on('window-all-closed', () => {
 app.on('before-quit', async () => {
   console.log('[Main] Shutting down...');
 
-  // Disconnect from I2P
+  // Disconnect from I2P (but keep i2pd running for tracker)
   await i2pConnection.disconnect();
 
-  // Stop i2pd daemon
-  await i2pdManager.stop();
+  // Don't stop i2pd - keep it running so tracker can continue working
+  // If you want to stop i2pd, run: i2pdManager.stop() manually
+  // await i2pdManager.stop();
 
   // Close database
   closeDatabase();
