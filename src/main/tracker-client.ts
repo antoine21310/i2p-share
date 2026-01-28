@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { toB32 } from '@diva.exchange/i2p-sam';
+import crypto from 'crypto';
 
 interface TrackerPeer {
   destination: string;
@@ -234,6 +235,9 @@ export class TrackerClient extends EventEmitter {
     const tracker = this.getActiveTracker();
     if (!this.sendMessage || !tracker) return;
 
+    // Ensure tracker address has .b32.i2p suffix for SAM lookup
+    const trackerDest = tracker.includes('.b32.i2p') ? tracker : `${tracker}.b32.i2p`;
+
     const message: TrackerMessage = {
       type: 'ANNOUNCE',
       payload: {
@@ -245,8 +249,8 @@ export class TrackerClient extends EventEmitter {
     };
 
     try {
-      await this.sendMessage(tracker, message);
-      console.log('[TrackerClient] Announced to tracker');
+      await this.sendMessage(trackerDest, message);
+      console.log('[TrackerClient] Announced to tracker:', trackerDest.substring(0, 20) + '...');
     } catch (error: any) {
       console.error('[TrackerClient] Announce failed:', error.message);
     }
@@ -256,6 +260,9 @@ export class TrackerClient extends EventEmitter {
     const tracker = this.getActiveTracker();
     if (!this.sendMessage || !tracker) return;
 
+    // Ensure tracker address has .b32.i2p suffix for SAM lookup
+    const trackerDest = tracker.includes('.b32.i2p') ? tracker : `${tracker}.b32.i2p`;
+
     const message: TrackerMessage = {
       type: 'GET_PEERS',
       payload: {},
@@ -263,7 +270,7 @@ export class TrackerClient extends EventEmitter {
     };
 
     try {
-      await this.sendMessage(tracker, message);
+      await this.sendMessage(trackerDest, message);
       console.log('[TrackerClient] Requested peer list from tracker');
     } catch (error: any) {
       console.error('[TrackerClient] Request peers failed:', error.message);
@@ -271,11 +278,22 @@ export class TrackerClient extends EventEmitter {
   }
 
   handleMessage(from: string, message: any): boolean {
-    // Check if message is from any of our trackers
-    const trackerIndex = this.config.trackerAddresses.indexOf(from);
+    // Convert sender's full destination to b32 for comparison
+    const fromB32 = toB32(from);
+
+    // Check if message is from any of our trackers (compare b32 addresses)
+    const trackerIndex = this.config.trackerAddresses.findIndex(addr => {
+      // Remove .b32.i2p suffix if present for comparison
+      const cleanAddr = addr.replace(/\.b32\.i2p$/i, '').toLowerCase();
+      const cleanFrom = fromB32.replace(/\.b32\.i2p$/i, '').toLowerCase();
+      return cleanAddr === cleanFrom;
+    });
+
     if (trackerIndex < 0) {
       return false; // Not a tracker message
     }
+
+    console.log(`[TrackerClient] Received message from tracker: ${message.type}`);
 
     // Update last response time
     this.lastResponseTime.set(from, Date.now());

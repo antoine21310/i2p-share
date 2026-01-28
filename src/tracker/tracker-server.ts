@@ -137,11 +137,20 @@ export class TrackerServer extends EventEmitter {
       }
 
       console.log('[Tracker] ════════════════════════════════════════════════════════');
-      console.log('[Tracker] TRACKER ADDRESS (this is permanent, share it!):');
+      console.log('[Tracker] TRACKER READY!');
       console.log('[Tracker]');
+      console.log('[Tracker] B32 Address (short, for display):');
       console.log('[Tracker]   ' + this.b32Address);
       console.log('[Tracker]');
+      console.log('[Tracker] Full Destination (use this in settings):');
+      console.log('[Tracker]   ' + this.destination);
+      console.log('[Tracker]');
       console.log('[Tracker] ════════════════════════════════════════════════════════');
+
+      // Also save to a file for easy copy
+      const destFile = path.join(this.config.dataDir, 'tracker-destination.txt');
+      fs.writeFileSync(destFile, this.destination);
+      console.log('[Tracker] Destination saved to:', destFile);
 
       // Create RAW session for datagram communication
       console.log('[Tracker] Creating RAW session...');
