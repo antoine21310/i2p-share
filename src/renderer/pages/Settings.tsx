@@ -1,8 +1,12 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useStore } from '../store';
 
 export function SettingsPage() {
   const { networkStatus } = useStore();
+  const [trackerAddresses, setTrackerAddresses] = useState('');
+  const [activeTracker, setActiveTracker] = useState<string | null>(null);
+  const [trackerSaving, setTrackerSaving] = useState(false);
+  const [trackerSaved, setTrackerSaved] = useState(false);
   const [settings, setSettings] = useState({
     maxUploadSpeed: 5,
     maxDownloadSpeed: 10,
@@ -15,12 +19,37 @@ export function SettingsPage() {
     anonymousReporting: true,
   });
 
+  // Load tracker addresses on mount
+  useEffect(() => {
+    window.electron.getTrackerAddresses().then((addresses: string[]) => {
+      setTrackerAddresses(addresses.join('\n'));
+    });
+    window.electron.getActiveTracker().then(setActiveTracker);
+  }, []);
+
   const handleConnect = async () => {
     await window.electron.connect();
   };
 
   const handleDisconnect = async () => {
     await window.electron.disconnect();
+  };
+
+  const handleSaveTrackers = async () => {
+    setTrackerSaving(true);
+    try {
+      const addresses = trackerAddresses
+        .split('\n')
+        .map(a => a.trim())
+        .filter(a => a.length > 0);
+      await window.electron.setTrackerAddresses(addresses);
+      setTrackerSaved(true);
+      setTimeout(() => setTrackerSaved(false), 2000);
+      // Refresh active tracker
+      window.electron.getActiveTracker().then(setActiveTracker);
+    } finally {
+      setTrackerSaving(false);
+    }
   };
 
   return (
@@ -82,6 +111,65 @@ export function SettingsPage() {
                   className="w-full opacity-50 cursor-not-allowed"
                 />
               </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Tracker Section */}
+        <section className="mb-8">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <svg className="w-5 h-5 text-primary-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+            </svg>
+            Peer Discovery (Trackers)
+          </h2>
+          <div className="card p-6 space-y-4">
+            {/* Active tracker status */}
+            {activeTracker && (
+              <div className="flex items-center gap-2 text-sm">
+                <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                <span className="text-dark-400">Connected to:</span>
+                <code className="text-primary-400 text-xs">{activeTracker.substring(0, 32)}...</code>
+              </div>
+            )}
+
+            <div>
+              <label className="block text-sm font-medium text-dark-300 mb-2">
+                Tracker Addresses
+              </label>
+              <p className="text-xs text-dark-500 mb-2">
+                Enter I2P tracker addresses (.b32.i2p), one per line.
+                A random tracker will be selected for anti-censorship.
+              </p>
+              <textarea
+                value={trackerAddresses}
+                onChange={(e) => setTrackerAddresses(e.target.value)}
+                placeholder="tracker1.b32.i2p&#10;tracker2.b32.i2p&#10;tracker3.b32.i2p"
+                className="w-full h-24 font-mono text-sm resize-none"
+                rows={4}
+              />
+              <div className="flex justify-between items-center mt-2">
+                <span className="text-xs text-dark-500">
+                  {trackerAddresses.split('\n').filter(a => a.trim()).length} tracker(s) configured
+                </span>
+                <button
+                  onClick={handleSaveTrackers}
+                  disabled={trackerSaving}
+                  className="btn btn-primary"
+                >
+                  {trackerSaving ? 'Saving...' : trackerSaved ? 'Saved!' : 'Save'}
+                </button>
+              </div>
+            </div>
+
+            <div className="text-sm text-dark-400 bg-dark-800/50 rounded-lg p-3">
+              <p className="font-medium text-dark-300 mb-1">Anti-censorship:</p>
+              <ul className="list-disc list-inside space-y-1 text-xs">
+                <li>Add multiple trackers for redundancy</li>
+                <li>A random tracker is selected at connection</li>
+                <li>If one fails, another is automatically tried</li>
+                <li>Run your own: <code className="bg-dark-700 px-1 rounded">npm run tracker</code></li>
+              </ul>
             </div>
           </div>
         </section>

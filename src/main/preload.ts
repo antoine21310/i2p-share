@@ -27,6 +27,16 @@ interface ElectronAPI {
   // Peers
   getPeers: () => Promise<any[]>;
 
+  // Tracker
+  getTrackerAddresses: () => Promise<string[]>;
+  setTrackerAddresses: (addresses: string[]) => Promise<{ success: boolean }>;
+  getActiveTracker: () => Promise<string | null>;
+  getTrackerPeers: () => Promise<any[]>;
+  refreshTrackerPeers: () => Promise<{ success: boolean }>;
+  // Legacy single address (backwards compat)
+  getTrackerAddress: () => Promise<string>;
+  setTrackerAddress: (address: string) => Promise<{ success: boolean }>;
+
   // Window controls
   minimizeWindow: () => Promise<void>;
   maximizeWindow: () => Promise<void>;
@@ -81,6 +91,23 @@ const api: ElectronAPI = {
   // Peers
   getPeers: () =>
     ipcRenderer.invoke('peers:list'),
+
+  // Tracker
+  getTrackerAddresses: () =>
+    ipcRenderer.invoke('tracker:get-addresses'),
+  setTrackerAddresses: (addresses: string[]) =>
+    ipcRenderer.invoke('tracker:set-addresses', addresses),
+  getActiveTracker: () =>
+    ipcRenderer.invoke('tracker:get-active'),
+  getTrackerPeers: () =>
+    ipcRenderer.invoke('tracker:get-peers'),
+  refreshTrackerPeers: () =>
+    ipcRenderer.invoke('tracker:refresh'),
+  // Legacy single address (backwards compat)
+  getTrackerAddress: () =>
+    ipcRenderer.invoke('tracker:get-address'),
+  setTrackerAddress: (address: string) =>
+    ipcRenderer.invoke('tracker:set-address', address),
 
   // Window controls
   minimizeWindow: () =>

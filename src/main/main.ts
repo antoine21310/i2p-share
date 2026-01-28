@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import path from 'path';
+import Store from 'electron-store';
 import { initDatabase, closeDatabase, FileOps, SharedFolderOps, PeerOps } from './database';
 import { fileIndexer } from './file-indexer';
 import { dhtSearch } from './dht-search';
@@ -7,7 +8,15 @@ import { fileServer } from './file-server';
 import { downloadClient } from './download-client';
 import { i2pConnection } from './i2p-connection';
 import { i2pdManager } from './i2pd-manager';
+import { trackerClient } from './tracker-client';
 import type { SearchFilters, NetworkStats, SearchResult } from '../shared/types';
+
+// Configuration store
+const store = new Store({
+  defaults: {
+    trackerAddresses: [] as string[] // List of tracker addresses for redundancy
+  }
+});
 
 let mainWindow: BrowserWindow | null = null;
 let connectionStatus: 'disconnected' | 'downloading' | 'starting' | 'connecting' | 'connected' | 'error' = 'disconnected';
@@ -163,10 +172,14 @@ function setupIPC(): void {
         break;
     }
 
+    // Combine DHT nodes and tracker peers
+    const trackerPeersCount = trackerClient.getPeersCount();
+    const totalPeers = Math.max(dhtStats.nodesCount, trackerPeersCount);
+
     return {
       isConnected: connectionStatus === 'connected',
       activeTunnels: i2pState.isConnected ? 12 : 0,
-      peersConnected: dhtStats.nodesCount,
+      peersConnected: totalPeers,
       uploadSpeed: uploadStats.totalSpeed,
       downloadSpeed: activeDownloads.reduce((sum, d) => sum + d.speed, 0),
       totalUploaded: 0,
@@ -208,6 +221,9 @@ function setupIPC(): void {
         // Start file server and download client
         fileServer.setConnection(i2pConnection);
         downloadClient.setConnection(i2pConnection);
+
+        // Connect to tracker for peer discovery
+        await connectToTracker(result.destination);
 
         // Announce ourselves to the network
         const files = fileIndexer.getAllFiles();
@@ -278,6 +294,90 @@ function setupIPC(): void {
   ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
     shell.showItemInFolder(filePath);
   });
+
+  // Tracker configuration
+  ipcMain.handle('tracker:get-addresses', async () => {
+    return store.get('trackerAddresses', []);
+  });
+
+  ipcMain.handle('tracker:set-addresses', async (_event, addresses: string[]) => {
+    const validAddresses = addresses.filter(a => a && a.trim().length > 0);
+    store.set('trackerAddresses', validAddresses);
+    trackerClient.setTrackerAddresses(validAddresses);
+
+    // If already connected to I2P, reconnect to trackers
+    if (i2pConnection.isReady()) {
+      const state = i2pConnection.getState();
+      await connectToTracker(state.destination);
+    }
+
+    return { success: true };
+  });
+
+  ipcMain.handle('tracker:get-active', async () => {
+    return trackerClient.getActiveTracker();
+  });
+
+  ipcMain.handle('tracker:get-peers', async () => {
+    return trackerClient.getPeers();
+  });
+
+  ipcMain.handle('tracker:refresh', async () => {
+    await trackerClient.requestPeers();
+    return { success: true };
+  });
+
+  // Legacy single address support (for backwards compatibility)
+  ipcMain.handle('tracker:get-address', async () => {
+    const addresses = store.get('trackerAddresses', []) as string[];
+    return addresses.length > 0 ? addresses[0] : '';
+  });
+
+  ipcMain.handle('tracker:set-address', async (_event, address: string) => {
+    const addresses = address ? [address] : [];
+    store.set('trackerAddresses', addresses);
+    trackerClient.setTrackerAddresses(addresses);
+
+    if (i2pConnection.isReady()) {
+      const state = i2pConnection.getState();
+      await connectToTracker(state.destination);
+    }
+
+    return { success: true };
+  });
+}
+
+async function connectToTracker(myDestination: string): Promise<void> {
+  const trackerAddresses = store.get('trackerAddresses', []) as string[];
+
+  if (trackerAddresses.length === 0) {
+    console.log('[Main] No tracker addresses configured - peer discovery disabled');
+    console.log('[Main] Configure tracker addresses in settings to discover peers');
+    return;
+  }
+
+  console.log(`[Main] Connecting to trackers (${trackerAddresses.length} configured)...`);
+
+  // Set up tracker client with all addresses
+  trackerClient.setTrackerAddresses(trackerAddresses);
+  trackerClient.setIdentity(myDestination);
+  trackerClient.setMessageHandler(async (dest, msg) => {
+    return await i2pConnection.sendMessage(dest, msg);
+  });
+
+  // Update stats
+  const files = fileIndexer.getAllFiles();
+  trackerClient.updateStats(files.length, files.reduce((sum, f: any) => sum + f.size, 0));
+
+  // Connect to a random tracker
+  const connected = await trackerClient.connect();
+
+  if (connected) {
+    const activeTracker = trackerClient.getActiveTracker();
+    console.log('[Main] Connected to tracker:', activeTracker?.substring(0, 20) + '...');
+  } else {
+    console.log('[Main] Failed to connect to any tracker');
+  }
 }
 
 function setupEventForwarding(): void {
@@ -346,8 +446,36 @@ function setupEventForwarding(): void {
   });
 
   i2pConnection.on('message', ({ from, message }) => {
-    // Route messages to DHT handler
-    dhtSearch.handleMessage(from, message);
+    // First check if it's a tracker message
+    const isTrackerMessage = trackerClient.handleMessage(from, message);
+
+    // If not a tracker message, route to DHT handler
+    if (!isTrackerMessage) {
+      dhtSearch.handleMessage(from, message);
+    }
+  });
+
+  // Forward tracker events
+  trackerClient.on('peer:discovered', (peer) => {
+    console.log('[Main] New peer from tracker:', peer.b32Address.substring(0, 16) + '...');
+
+    // Add to DHT routing table for future communication
+    const nodeId = require('crypto').createHash('sha1').update(peer.destination).digest('hex');
+    dhtSearch.updateNode(nodeId, peer.destination);
+
+    // Save to database
+    PeerOps.upsert({
+      peerId: peer.destination,
+      displayName: peer.displayName,
+      filesCount: peer.filesCount,
+      totalSize: peer.totalSize
+    });
+
+    mainWindow?.webContents.send('peer:discovered', peer);
+  });
+
+  trackerClient.on('peers:updated', (peers) => {
+    mainWindow?.webContents.send('tracker:peers-updated', peers);
   });
 
   // Forward i2pd manager events
@@ -406,6 +534,9 @@ async function startI2PAndConnect(): Promise<void> {
       // Start file server and download client
       fileServer.setConnection(i2pConnection);
       downloadClient.setConnection(i2pConnection);
+
+      // Connect to tracker for peer discovery
+      await connectToTracker(result.destination);
 
       mainWindow?.webContents.send('network:connected', {
         address: result.b32Address

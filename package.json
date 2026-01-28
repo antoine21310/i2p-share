@@ -13,7 +13,10 @@
     "start": "electron .",
     "electron:dev": "cross-env NODE_ENV=development electron .",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
-    "postinstall": "electron-rebuild -f -w better-sqlite3"
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "build:tracker": "tsc -p tsconfig.tracker.json",
+    "tracker": "npm run build:tracker && node dist/tracker/index.js",
+    "tracker:dev": "tsc -p tsconfig.tracker.json && node dist/tracker/index.js"
   },
   "dependencies": {
     "@diva.exchange/i2p-sam": "^5.5.2",
