@@ -127,19 +127,21 @@ function setupIPC(): void {
 
   // Downloads - use streaming client for reliable transfers
   // peerId can be either the datagram destination or the streaming destination
-  ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number, streamingDest?: string) => {
+  ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) => {
     if (!i2pConnection.isReady()) {
       throw new Error('Not connected to I2P network');
     }
+
+    const displayName = peerName || 'Unknown Peer';
 
     if (USE_STREAMING) {
       // Use I2P Streaming for reliable transfers with resume support
       // Prefer streaming destination if available, fall back to regular peerId
       const targetDest = streamingDest || peerId;
-      return streamingClient.addDownload(filename, fileHash, targetDest, 'Unknown Peer', size);
+      return streamingClient.addDownload(filename, fileHash, targetDest, displayName, size);
     } else {
       // Legacy UDP-based transfers
-      return downloadClient.addDownload(filename, fileHash, peerId, 'Unknown Peer', size);
+      return downloadClient.addDownload(filename, fileHash, peerId, displayName, size);
     }
   });
 
@@ -172,6 +174,24 @@ function setupIPC(): void {
       return streamingClient.getDownloads();
     } else {
       return downloadClient.getDownloads();
+    }
+  });
+
+  // Active uploads (files being downloaded by other peers)
+  ipcMain.handle('uploads:active', async () => {
+    if (USE_STREAMING) {
+      const sessions = streamingServer.getActiveSessions();
+      return sessions.map(s => ({
+        sessionId: s.clientId,
+        filename: s.filename,
+        totalSize: s.totalSize,
+        bytesSent: s.bytesSent,
+        speed: s.speed,
+        progress: s.totalSize > 0 ? (s.bytesSent / s.totalSize) * 100 : 0,
+        isPaused: s.isPaused
+      }));
+    } else {
+      return [];
     }
   });
 
@@ -586,6 +606,10 @@ async function requestFilesFromPeer(peerDestination: string): Promise<void> {
 
 function setupEventForwarding(): void {
   // Forward file indexer events
+  fileIndexer.on('scan:start', (data) => {
+    mainWindow?.webContents.send('scan:start', data);
+  });
+
   fileIndexer.on('scan:progress', (data) => {
     mainWindow?.webContents.send('scan:progress', data);
   });

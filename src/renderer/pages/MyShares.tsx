@@ -1,13 +1,70 @@
 import React, { useEffect, useState } from 'react';
 import { useStore } from '../store';
 
+interface ScanProgress {
+  folder: string;
+  scanned: number;
+  total: number;
+  currentFile: string;
+}
+
+interface ActiveUpload {
+  sessionId: string;
+  filename: string;
+  totalSize: number;
+  bytesSent: number;
+  speed: number;
+  progress: number;
+  isPaused: boolean;
+}
+
 export function MySharesPage() {
   const { sharedFolders, sharedFiles, fetchSharedFolders, fetchSharedFiles, addSharedFolder, removeSharedFolder } = useStore();
-  const [isScanning, setIsScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [activeUploads, setActiveUploads] = useState<ActiveUpload[]>([]);
 
   useEffect(() => {
     fetchSharedFolders();
     fetchSharedFiles();
+
+    // Poll for active uploads
+    const fetchUploads = async () => {
+      try {
+        const uploads = await window.electron.getActiveUploads();
+        setActiveUploads(uploads.filter((u: ActiveUpload) => !u.isPaused && u.progress < 100));
+      } catch (error) {
+        console.error('Error fetching active uploads:', error);
+      }
+    };
+    fetchUploads();
+    const uploadInterval = setInterval(fetchUploads, 1000);
+
+    // Listen for scan events
+    const unsubStart = window.electron.on('scan:start', (data: { folder: string; total: number }) => {
+      setScanProgress({ folder: data.folder, scanned: 0, total: data.total, currentFile: '' });
+    });
+
+    const unsubProgress = window.electron.on('scan:progress', (data: ScanProgress) => {
+      setScanProgress(data);
+      // Refresh file counts periodically during scan
+      if (data.scanned % 20 === 0) {
+        fetchSharedFiles();
+        fetchSharedFolders();
+      }
+    });
+
+    const unsubComplete = window.electron.on('scan:complete', () => {
+      setScanProgress(null);
+      fetchSharedFolders();
+      fetchSharedFiles();
+    });
+
+    return () => {
+      unsubStart();
+      unsubProgress();
+      unsubComplete();
+      clearInterval(uploadInterval);
+    };
   }, []);
 
   const totalFiles = sharedFiles.length;
@@ -58,6 +115,74 @@ export function MySharesPage() {
           </div>
         </div>
 
+        {/* Scanning progress */}
+        {scanProgress && (
+          <div className="card p-4 mb-8 border border-primary-500/30 bg-primary-500/5">
+            <div className="flex items-center gap-3 mb-3">
+              <svg className="w-5 h-5 text-primary-400 animate-spin" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+              <div className="flex-1">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-sm font-medium text-white">Indexing files...</span>
+                  <span className="text-sm text-dark-400">
+                    {scanProgress.scanned.toLocaleString()} / {scanProgress.total.toLocaleString()}
+                  </span>
+                </div>
+                <div className="progress-bar h-2">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${scanProgress.total > 0 ? (scanProgress.scanned / scanProgress.total) * 100 : 0}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="text-xs text-dark-400 truncate" title={scanProgress.currentFile}>
+              Hashing: {scanProgress.currentFile || '...'}
+            </div>
+          </div>
+        )}
+
+        {/* Active uploads */}
+        {activeUploads.length > 0 && (
+          <div className="card p-4 mb-8 border border-green-500/30 bg-green-500/5">
+            <div className="flex items-center gap-2 mb-4">
+              <svg className="w-5 h-5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+              </svg>
+              <h3 className="text-sm font-medium text-white">
+                {activeUploads.length} active upload{activeUploads.length > 1 ? 's' : ''}
+              </h3>
+            </div>
+            <div className="space-y-3">
+              {activeUploads.map((upload) => (
+                <div key={upload.sessionId} className="bg-dark-800/50 rounded-lg p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm text-white truncate flex-1 mr-4" title={upload.filename}>
+                      {upload.filename}
+                    </span>
+                    <span className="text-xs text-dark-400 whitespace-nowrap">
+                      {formatBytes(upload.bytesSent)} / {formatBytes(upload.totalSize)}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 progress-bar h-2">
+                      <div
+                        className="progress-fill bg-green-500"
+                        style={{ width: `${upload.progress}%` }}
+                      />
+                    </div>
+                    <span className="text-xs text-green-400 whitespace-nowrap">
+                      {upload.speed > 0 ? `${formatBytes(upload.speed)}/s` : '—'}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Shared folders */}
         <section className="mb-8">
           <h2 className="text-lg font-semibold text-white mb-4">Shared Folders</h2>
@@ -94,7 +219,7 @@ export function MySharesPage() {
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      {folder.isScanning && (
+                      {scanProgress && scanProgress.folder === folder.path && (
                         <span className="flex items-center gap-2 text-sm text-primary-400">
                           <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24">
                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />

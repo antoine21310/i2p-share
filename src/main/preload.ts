@@ -6,11 +6,12 @@ interface ElectronAPI {
   search: (query: string, filters: any) => Promise<any[]>;
 
   // Downloads
-  startDownload: (fileHash: string, peerId: string, filename: string, size: number, streamingDest?: string) => Promise<number>;
+  startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) => Promise<number>;
   pauseDownload: (downloadId: number) => Promise<void>;
   resumeDownload: (downloadId: number) => Promise<void>;
   cancelDownload: (downloadId: number) => Promise<void>;
   getDownloads: () => Promise<any[]>;
+  getActiveUploads: () => Promise<any[]>;
 
   // Shares
   addSharedFolder: () => Promise<any>;
@@ -64,8 +65,8 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('search:query', query, filters),
 
   // Downloads
-  startDownload: (fileHash: string, peerId: string, filename: string, size: number, streamingDest?: string) =>
-    ipcRenderer.invoke('download:start', fileHash, peerId, filename, size, streamingDest),
+  startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) =>
+    ipcRenderer.invoke('download:start', fileHash, peerId, filename, size, peerName, streamingDest),
   pauseDownload: (downloadId: number) =>
     ipcRenderer.invoke('download:pause', downloadId),
   resumeDownload: (downloadId: number) =>
@@ -74,6 +75,8 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('download:cancel', downloadId),
   getDownloads: () =>
     ipcRenderer.invoke('download:list'),
+  getActiveUploads: () =>
+    ipcRenderer.invoke('uploads:active'),
 
   // Shares
   addSharedFolder: () =>

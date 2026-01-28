@@ -130,6 +130,7 @@ export const useStore = create<AppStore>((set, get) => ({
         result.peerId,
         result.filename,
         result.size,
+        result.peerDisplayName || 'Unknown Peer',
         result.streamingDestination // For I2P Streaming file transfers
       );
       await get().fetchDownloads();
