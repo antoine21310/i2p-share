@@ -6,7 +6,7 @@ interface ElectronAPI {
   search: (query: string, filters: any) => Promise<any[]>;
 
   // Downloads
-  startDownload: (fileHash: string, peerId: string, filename: string, size: number) => Promise<number>;
+  startDownload: (fileHash: string, peerId: string, filename: string, size: number, streamingDest?: string) => Promise<number>;
   pauseDownload: (downloadId: number) => Promise<void>;
   resumeDownload: (downloadId: number) => Promise<void>;
   cancelDownload: (downloadId: number) => Promise<void>;
@@ -60,8 +60,8 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('search:query', query, filters),
 
   // Downloads
-  startDownload: (fileHash: string, peerId: string, filename: string, size: number) =>
-    ipcRenderer.invoke('download:start', fileHash, peerId, filename, size),
+  startDownload: (fileHash: string, peerId: string, filename: string, size: number, streamingDest?: string) =>
+    ipcRenderer.invoke('download:start', fileHash, peerId, filename, size, streamingDest),
   pauseDownload: (downloadId: number) =>
     ipcRenderer.invoke('download:pause', downloadId),
   resumeDownload: (downloadId: number) =>

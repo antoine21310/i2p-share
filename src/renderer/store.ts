@@ -8,6 +8,7 @@ interface SearchResult {
   peerId: string;
   peerDisplayName: string;
   addedAt: number;
+  streamingDestination?: string; // For I2P Streaming file transfers
 }
 
 interface Download {
@@ -37,6 +38,7 @@ interface Peer {
   totalSize: number;
   isOnline: boolean;
   lastSeen: number;
+  streamingDestination?: string; // For I2P Streaming file transfers
 }
 
 interface NetworkStatus {
@@ -127,7 +129,8 @@ export const useStore = create<AppStore>((set, get) => ({
         result.fileHash,
         result.peerId,
         result.filename,
-        result.size
+        result.size,
+        result.streamingDestination // For I2P Streaming file transfers
       );
       await get().fetchDownloads();
     } catch (error) {

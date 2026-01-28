@@ -6,10 +6,15 @@ import { fileIndexer } from './file-indexer';
 import { dhtSearch } from './dht-search';
 import { fileServer } from './file-server';
 import { downloadClient } from './download-client';
+import { streamingClient } from './streaming-client';
+import { streamingServer } from './streaming-server';
 import { i2pConnection } from './i2p-connection';
 import { i2pdManager } from './i2pd-manager';
 import { trackerClient } from './tracker-client';
 import type { SearchFilters, NetworkStats, SearchResult } from '../shared/types';
+
+// Use streaming by default (more reliable), fallback to UDP for compatibility
+const USE_STREAMING = true;
 
 // Configuration store
 const store = new Store({
@@ -119,28 +124,54 @@ function setupIPC(): void {
     return results;
   });
 
-  // Downloads
-  ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number) => {
+  // Downloads - use streaming client for reliable transfers
+  // peerId can be either the datagram destination or the streaming destination
+  ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number, streamingDest?: string) => {
     if (!i2pConnection.isReady()) {
       throw new Error('Not connected to I2P network');
     }
-    return downloadClient.addDownload(filename, fileHash, peerId, 'Unknown Peer', size);
+
+    if (USE_STREAMING) {
+      // Use I2P Streaming for reliable transfers with resume support
+      // Prefer streaming destination if available, fall back to regular peerId
+      const targetDest = streamingDest || peerId;
+      return streamingClient.addDownload(filename, fileHash, targetDest, 'Unknown Peer', size);
+    } else {
+      // Legacy UDP-based transfers
+      return downloadClient.addDownload(filename, fileHash, peerId, 'Unknown Peer', size);
+    }
   });
 
   ipcMain.handle('download:pause', async (_event, downloadId: number) => {
-    downloadClient.pauseDownload(downloadId);
+    if (USE_STREAMING) {
+      streamingClient.pauseDownload(downloadId);
+    } else {
+      downloadClient.pauseDownload(downloadId);
+    }
   });
 
   ipcMain.handle('download:resume', async (_event, downloadId: number) => {
-    downloadClient.resumeDownload(downloadId);
+    if (USE_STREAMING) {
+      streamingClient.resumeDownload(downloadId);
+    } else {
+      downloadClient.resumeDownload(downloadId);
+    }
   });
 
   ipcMain.handle('download:cancel', async (_event, downloadId: number) => {
-    downloadClient.cancelDownload(downloadId);
+    if (USE_STREAMING) {
+      streamingClient.cancelDownload(downloadId);
+    } else {
+      downloadClient.cancelDownload(downloadId);
+    }
   });
 
   ipcMain.handle('download:list', async () => {
-    return downloadClient.getDownloads();
+    if (USE_STREAMING) {
+      return streamingClient.getDownloads();
+    } else {
+      return downloadClient.getDownloads();
+    }
   });
 
   // Shares
@@ -181,8 +212,8 @@ function setupIPC(): void {
   // Network
   ipcMain.handle('network:status', async (): Promise<NetworkStats & { statusText: string }> => {
     const dhtStats = dhtSearch.getStats();
-    const uploadStats = fileServer.getStats();
-    const activeDownloads = downloadClient.getActiveDownloads();
+    const uploadStats = USE_STREAMING ? streamingServer.getStats() : fileServer.getStats();
+    const activeDownloads = USE_STREAMING ? streamingClient.getActiveDownloads() : downloadClient.getActiveDownloads();
     const i2pState = i2pConnection.getState();
 
     let statusText = '';
@@ -254,8 +285,24 @@ function setupIPC(): void {
         });
 
         // Start file server and download client
-        fileServer.setConnection(i2pConnection);
-        downloadClient.setConnection(i2pConnection);
+        if (USE_STREAMING) {
+          // Start streaming server for reliable file transfers
+          console.log('[Main] Starting streaming server...');
+          try {
+            const streamingDest = await streamingServer.start();
+            console.log('[Main] Streaming server started');
+            // Set streaming destination for tracker announcements
+            trackerClient.setStreamingDestination(streamingDest);
+          } catch (err: any) {
+            console.error('[Main] Failed to start streaming server:', err.message);
+          }
+          // Load pending downloads
+          streamingClient.loadFromDatabase();
+        } else {
+          // Legacy UDP-based transfers
+          fileServer.setConnection(i2pConnection);
+          downloadClient.setConnection(i2pConnection);
+        }
 
         // Connect to tracker for peer discovery
         await connectToTracker(result.destination);
@@ -295,14 +342,29 @@ function setupIPC(): void {
 
   // Peers
   ipcMain.handle('peers:list', async () => {
-    const dbPeers = PeerOps.getAll() as any[];
-    // Check which peers we've seen recently (within last 5 minutes)
-    // Note: lastSeen is stored as Unix timestamp in seconds, not milliseconds
-    const fiveMinutesAgoInSeconds = Math.floor(Date.now() / 1000) - 5 * 60;
-    return dbPeers.map(p => ({
-      ...p,
-      isOnline: p.lastSeen > fiveMinutesAgoInSeconds
-    }));
+    // Return only online peers from the tracker (no database storage)
+    const trackerPeers = trackerClient.getPeers();
+
+    // Deduplicate by destination (use Map to keep only unique peers)
+    const uniquePeers = new Map<string, any>();
+    for (const peer of trackerPeers) {
+      // Use b32 address as key for deduplication
+      const key = peer.b32Address || peer.destination.substring(0, 50);
+      if (!uniquePeers.has(key)) {
+        uniquePeers.set(key, {
+          peerId: peer.destination,
+          displayName: peer.displayName || 'Unknown',
+          filesCount: peer.filesCount || 0,
+          totalSize: peer.totalSize || 0,
+          b32Address: peer.b32Address,
+          streamingDestination: peer.streamingDestination, // For I2P Streaming downloads
+          isOnline: true, // All tracker peers are online
+          lastSeen: Math.floor(Date.now() / 1000)
+        });
+      }
+    }
+
+    return Array.from(uniquePeers.values());
   });
 
   ipcMain.handle('peers:get-files', async (_event, peerId: string) => {
@@ -517,18 +579,53 @@ function setupEventForwarding(): void {
     }
   });
 
-  // Forward download events
-  downloadClient.on('download:progress', (data) => {
-    mainWindow?.webContents.send('download:progress', data);
-  });
+  // Forward download events (both streaming and legacy)
+  if (USE_STREAMING) {
+    streamingClient.on('download:progress', (data) => {
+      mainWindow?.webContents.send('download:progress', data);
+    });
 
-  downloadClient.on('download:completed', (data) => {
-    mainWindow?.webContents.send('download:completed', data);
-  });
+    streamingClient.on('download:completed', (data) => {
+      mainWindow?.webContents.send('download:completed', data);
+    });
 
-  downloadClient.on('download:failed', (data) => {
-    mainWindow?.webContents.send('download:failed', data);
-  });
+    streamingClient.on('download:failed', (data) => {
+      mainWindow?.webContents.send('download:failed', data);
+    });
+
+    streamingClient.on('download:paused', (data) => {
+      mainWindow?.webContents.send('download:paused', data);
+    });
+
+    streamingClient.on('download:resumed', (data) => {
+      mainWindow?.webContents.send('download:resumed', data);
+    });
+
+    // Forward upload events from streaming server
+    streamingServer.on('upload:start', (data) => {
+      mainWindow?.webContents.send('upload:start', data);
+    });
+
+    streamingServer.on('upload:progress', (data) => {
+      mainWindow?.webContents.send('upload:progress', data);
+    });
+
+    streamingServer.on('upload:complete', (data) => {
+      mainWindow?.webContents.send('upload:complete', data);
+    });
+  } else {
+    downloadClient.on('download:progress', (data) => {
+      mainWindow?.webContents.send('download:progress', data);
+    });
+
+    downloadClient.on('download:completed', (data) => {
+      mainWindow?.webContents.send('download:completed', data);
+    });
+
+    downloadClient.on('download:failed', (data) => {
+      mainWindow?.webContents.send('download:failed', data);
+    });
+  }
 
   // Forward DHT events
   dhtSearch.on('search:result', (data) => {
@@ -693,8 +790,24 @@ async function startI2PAndConnect(): Promise<void> {
       });
 
       // Start file server and download client
-      fileServer.setConnection(i2pConnection);
-      downloadClient.setConnection(i2pConnection);
+      if (USE_STREAMING) {
+        // Start streaming server for reliable file transfers
+        console.log('[Main] Starting streaming server...');
+        try {
+          const streamingDest = await streamingServer.start();
+          console.log('[Main] Streaming server started');
+          // Set streaming destination for tracker announcements
+          trackerClient.setStreamingDestination(streamingDest);
+        } catch (err: any) {
+          console.error('[Main] Failed to start streaming server:', err.message);
+        }
+        // Load pending downloads
+        streamingClient.loadFromDatabase();
+      } else {
+        // Legacy UDP-based transfers
+        fileServer.setConnection(i2pConnection);
+        downloadClient.setConnection(i2pConnection);
+      }
 
       // Connect to tracker for peer discovery
       await connectToTracker(result.destination);
@@ -731,7 +844,10 @@ app.whenReady().then(async () => {
 
   // Load saved data
   dhtSearch.loadFromDatabase();
-  downloadClient.loadFromDatabase();
+  if (!USE_STREAMING) {
+    downloadClient.loadFromDatabase();
+  }
+  // Note: streamingClient.loadFromDatabase() is called when I2P connects
 
   // Setup IPC handlers
   setupIPC();
@@ -760,6 +876,11 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', async () => {
   console.log('[Main] Shutting down...');
+
+  // Stop streaming server
+  if (USE_STREAMING) {
+    await streamingServer.stop();
+  }
 
   // Disconnect from I2P (but keep i2pd running for tracker)
   await i2pConnection.disconnect();

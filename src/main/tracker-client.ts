@@ -8,6 +8,7 @@ interface TrackerPeer {
   displayName: string;
   filesCount: number;
   totalSize: number;
+  streamingDestination?: string; // Destination for I2P streaming file transfers
 }
 
 interface TrackerMessage {
@@ -35,6 +36,7 @@ export class TrackerClient extends EventEmitter {
   private config: TrackerClientConfig;
   private sendMessage: ((dest: string, msg: any) => Promise<boolean>) | null = null;
   private myDestination: string = '';
+  private streamingDestination: string = ''; // Destination for streaming file server
   private displayName: string = 'I2P Share User';
   private filesCount: number = 0;
   private totalSize: number = 0;
@@ -102,6 +104,11 @@ export class TrackerClient extends EventEmitter {
   setIdentity(destination: string, displayName: string = 'I2P Share User'): void {
     this.myDestination = destination;
     this.displayName = displayName;
+  }
+
+  setStreamingDestination(destination: string): void {
+    this.streamingDestination = destination;
+    console.log(`[TrackerClient] Streaming destination set: ${destination.substring(0, 30)}...`);
   }
 
   updateStats(filesCount: number, totalSize: number): void {
@@ -240,13 +247,20 @@ export class TrackerClient extends EventEmitter {
 
     // Use the tracker address directly - it should be a full I2P destination
     // (Full destinations are base64 strings, typically ending in AAAA)
+    const payload: any = {
+      displayName: this.displayName,
+      filesCount: this.filesCount,
+      totalSize: this.totalSize
+    };
+
+    // Include streaming destination if available (for I2P Streaming file transfers)
+    if (this.streamingDestination) {
+      payload.streamingDestination = this.streamingDestination;
+    }
+
     const message: TrackerMessage = {
       type: 'ANNOUNCE',
-      payload: {
-        displayName: this.displayName,
-        filesCount: this.filesCount,
-        totalSize: this.totalSize
-      },
+      payload,
       timestamp: Date.now()
     };
 

@@ -50,28 +50,35 @@ export class DownloadClient extends EventEmitter {
 
   // Set the I2P connection for file transfers
   setConnection(conn: I2PConnection): void {
-    // Create a message handler that sends requests and waits for response
+    // Create a message handler that sends requests and waits for JSON response
     this.messageHandler = async (to: string, message: any): Promise<Buffer> => {
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
-          reject(new Error('Request timeout'));
-        }, 30000);
+          conn.off('message', onMessage);
+          reject(new Error('Request timeout (60s)'));
+        }, 60000); // Increased timeout for I2P
 
-        // Set up one-time listener for the response
-        const onData = ({ from, data }: { from: string; data: Buffer }) => {
-          if (from === to) {
+        // Set up listener for JSON response with base64 data
+        const onMessage = ({ from, message: msg }: { from: string; message: any }) => {
+          if (from === to && msg.type === 'file_chunk' && msg.fileHash === message.fileHash) {
             clearTimeout(timeout);
-            conn.off('data', onData);
+            conn.off('message', onMessage);
+            // Decode base64 data
+            const data = Buffer.from(msg.data, 'base64');
             resolve(data);
+          } else if (from === to && msg.type === 'file_error') {
+            clearTimeout(timeout);
+            conn.off('message', onMessage);
+            reject(new Error(msg.error || 'File transfer error'));
           }
         };
 
-        conn.on('data', onData);
+        conn.on('message', onMessage);
 
         // Send the request
         conn.sendMessage(to, message).catch((err) => {
           clearTimeout(timeout);
-          conn.off('data', onData);
+          conn.off('message', onMessage);
           reject(err);
         });
       });

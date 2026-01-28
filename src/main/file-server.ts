@@ -127,17 +127,28 @@ export class FileServer extends EventEmitter {
 
       let lastTime = Date.now();
       let lastBytes = 0;
+      let chunkIndex = 0;
 
       stream.on('data', (chunk) => {
         const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (!this.messageHandler) {
+        if (!this.connection) {
           stream.destroy();
-          reject(new Error('No message handler'));
+          reject(new Error('No connection'));
           return;
         }
 
-        // Send chunk
-        this.messageHandler(peerId, chunkBuffer);
+        // Send chunk as JSON message with base64-encoded data
+        // This ensures the _from field is included for proper routing
+        const response = {
+          type: 'file_chunk',
+          fileHash: session.fileHash,
+          chunkIndex: chunkIndex++,
+          data: chunkBuffer.toString('base64'),
+          offset: start + session.bytesSent,
+          size: chunkBuffer.length
+        };
+
+        this.connection.sendMessage(peerId, response);
         session.bytesSent += chunkBuffer.length;
 
         // Calculate speed
@@ -168,6 +179,14 @@ export class FileServer extends EventEmitter {
       });
 
       stream.on('end', () => {
+        // Send completion message
+        if (this.connection) {
+          this.connection.sendMessage(peerId, {
+            type: 'file_complete',
+            fileHash: session.fileHash,
+            totalSize: session.bytesSent
+          });
+        }
         resolve();
       });
 
@@ -177,10 +196,12 @@ export class FileServer extends EventEmitter {
     });
   }
 
-  private sendError(peerId: string, message: string): void {
-    if (this.messageHandler) {
-      const errorMsg = JSON.stringify({ error: message });
-      this.messageHandler(peerId, Buffer.from(errorMsg + '\n'));
+  private sendError(peerId: string, errorMessage: string): void {
+    if (this.connection) {
+      this.connection.sendMessage(peerId, {
+        type: 'file_error',
+        error: errorMessage
+      });
     }
   }
 

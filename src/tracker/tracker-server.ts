@@ -10,6 +10,7 @@ interface Peer {
   filesCount: number;
   totalSize: number;
   lastSeen: number;
+  streamingDestination?: string; // For I2P Streaming file transfers
 }
 
 interface TrackerConfig {
@@ -297,13 +298,17 @@ export class TrackerServer extends EventEmitter {
       displayName: payload.displayName || 'Unknown',
       filesCount: payload.filesCount || 0,
       totalSize: payload.totalSize || 0,
-      lastSeen: Date.now()
+      lastSeen: Date.now(),
+      streamingDestination: payload.streamingDestination // For I2P Streaming file transfers
     };
 
     this.peers.set(from, peer);
 
     if (isNew) {
       console.log(`[Tracker] New peer: ${b32.substring(0, 16)}... (${peer.displayName})`);
+      if (peer.streamingDestination) {
+        console.log(`[Tracker]   -> Has streaming destination`);
+      }
     } else {
       console.log(`[Tracker] Peer update: ${b32.substring(0, 16)}... (${peer.filesCount} files)`);
     }
@@ -360,7 +365,8 @@ export class TrackerServer extends EventEmitter {
         b32Address: p.b32Address,
         displayName: p.displayName,
         filesCount: p.filesCount,
-        totalSize: p.totalSize
+        totalSize: p.totalSize,
+        streamingDestination: p.streamingDestination // For I2P Streaming file transfers
       }));
 
     this.sendMessage(to, {
