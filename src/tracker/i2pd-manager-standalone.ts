@@ -1,11 +1,9 @@
 import { EventEmitter } from 'events';
-import { app } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import https from 'https';
 import { spawn, ChildProcess } from 'child_process';
 import { createWriteStream } from 'fs';
-import { pipeline } from 'stream/promises';
 
 // i2pd release URLs for each platform
 const I2PD_VERSION = '2.54.0';
@@ -21,17 +19,17 @@ interface I2PDState {
   progress?: number;
 }
 
-export class I2PDManager extends EventEmitter {
+export class I2PDManagerStandalone extends EventEmitter {
   private i2pdProcess: ChildProcess | null = null;
   private i2pdPath: string;
   private dataPath: string;
   private state: I2PDState = { status: 'stopped' };
 
-  constructor() {
+  constructor(basePath?: string) {
     super();
-    // Store i2pd in app's userData folder
-    const userDataPath = app?.getPath('userData') || path.join(process.cwd(), 'data');
-    this.i2pdPath = path.join(userDataPath, 'i2pd');
+    // Use provided path or current directory
+    const baseDir = basePath || path.join(process.cwd(), 'tracker-data');
+    this.i2pdPath = path.join(baseDir, 'i2pd');
     this.dataPath = path.join(this.i2pdPath, 'data');
   }
 
@@ -149,6 +147,7 @@ export class I2PDManager extends EventEmitter {
             if (totalSize > 0) {
               const progress = Math.round((downloadedSize / totalSize) * 100);
               this.setState({ progress });
+              process.stdout.write(`\r[I2PD] Downloading... ${progress}%`);
             }
           });
 
@@ -156,6 +155,7 @@ export class I2PDManager extends EventEmitter {
 
           file.on('finish', () => {
             file.close();
+            console.log('');
             resolve();
           });
 
@@ -182,7 +182,6 @@ export class I2PDManager extends EventEmitter {
 
       ps.on('close', (code) => {
         if (code === 0) {
-          // Move files from extracted folder to root if needed
           this.flattenExtractedDir();
           resolve();
         } else {
@@ -213,12 +212,10 @@ export class I2PDManager extends EventEmitter {
   }
 
   private flattenExtractedDir(): void {
-    // Sometimes archives extract into a subdirectory, move files up
     const entries = fs.readdirSync(this.i2pdPath);
     for (const entry of entries) {
       const entryPath = path.join(this.i2pdPath, entry);
       if (fs.statSync(entryPath).isDirectory() && entry.startsWith('i2pd')) {
-        // Move all files from subdirectory to i2pdPath
         const subEntries = fs.readdirSync(entryPath);
         for (const subEntry of subEntries) {
           const src = path.join(entryPath, subEntry);
@@ -227,7 +224,6 @@ export class I2PDManager extends EventEmitter {
             fs.renameSync(src, dest);
           }
         }
-        // Remove empty directory
         try {
           fs.rmdirSync(entryPath, { recursive: true });
         } catch (e) {
@@ -240,7 +236,7 @@ export class I2PDManager extends EventEmitter {
   private async createConfig(): Promise<void> {
     const configPath = path.join(this.i2pdPath, 'i2pd.conf');
 
-    const config = `# I2PD Configuration for I2P Share
+    const config = `# I2PD Configuration for I2P Share Tracker
 # Auto-generated - do not edit manually
 
 # General settings
@@ -254,10 +250,10 @@ ipv4 = true
 ipv6 = false
 nat = true
 
-# Bandwidth (KB/s) - adjust based on your connection
+# Bandwidth (KB/s)
 bandwidth = L
 
-# SAM interface (required for I2P Share)
+# SAM interface (required)
 [sam]
 enabled = true
 address = 127.0.0.1
@@ -293,13 +289,12 @@ enabled = true
     fs.writeFileSync(configPath, config, 'utf-8');
     console.log('[I2PD] Config created at:', configPath);
 
-    // Create data directory
     if (!fs.existsSync(this.dataPath)) {
       fs.mkdirSync(this.dataPath, { recursive: true });
     }
   }
 
-  // Check if SAM bridge is already available (external i2pd running)
+  // Check if SAM bridge is already available
   async isSAMAvailable(): Promise<boolean> {
     const net = require('net');
     return new Promise((resolve) => {
@@ -351,45 +346,60 @@ enabled = true
     console.log('[I2PD] Starting daemon...');
     this.setState({ status: 'starting' });
 
-    // Start i2pd process
-    this.i2pdProcess = spawn(execPath, ['--conf', configPath], {
-      cwd: this.i2pdPath,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false
-    });
+    try {
+      this.i2pdProcess = spawn(execPath, ['--conf', configPath], {
+        cwd: this.i2pdPath,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false
+      });
 
-    this.i2pdProcess.stdout?.on('data', (data) => {
-      console.log('[I2PD]', data.toString().trim());
-    });
+      this.i2pdProcess.stdout?.on('data', (data) => {
+        console.log('[I2PD]', data.toString().trim());
+      });
 
-    this.i2pdProcess.stderr?.on('data', (data) => {
-      console.error('[I2PD Error]', data.toString().trim());
-    });
+      this.i2pdProcess.stderr?.on('data', (data) => {
+        console.error('[I2PD Error]', data.toString().trim());
+      });
 
-    this.i2pdProcess.on('error', (err) => {
-      console.error('[I2PD] Process error:', err);
-      this.setState({ status: 'error', error: err.message });
-      this.i2pdProcess = null;
-    });
+      this.i2pdProcess.on('error', (err) => {
+        console.error('[I2PD] Process error:', err.message);
+        this.setState({ status: 'error', error: err.message });
+        this.i2pdProcess = null;
+      });
 
-    this.i2pdProcess.on('exit', (code, signal) => {
-      console.log(`[I2PD] Process exited with code ${code}, signal ${signal}`);
-      if (this.state.status === 'running') {
-        this.setState({ status: 'error', error: 'Process terminated unexpectedly' });
+      this.i2pdProcess.on('exit', (code, signal) => {
+        console.log(`[I2PD] Process exited with code ${code}, signal ${signal}`);
+        if (this.state.status === 'running') {
+          this.setState({ status: 'error', error: 'Process terminated unexpectedly' });
+        }
+        this.i2pdProcess = null;
+      });
+
+      // Wait for SAM to be ready
+      await this.waitForSAM();
+
+      this.setState({ status: 'running' });
+      console.log('[I2PD] Daemon started successfully');
+    } catch (err: any) {
+      console.error('[I2PD] Failed to start daemon:', err.message);
+
+      // Check if SAM became available anyway (maybe external i2pd started)
+      const samNowAvailable = await this.isSAMAvailable();
+      if (samNowAvailable) {
+        console.log('[I2PD] SAM bridge became available (external i2pd?)');
+        this.setState({ status: 'running' });
+        return;
       }
-      this.i2pdProcess = null;
-    });
 
-    // Wait for SAM to be ready
-    await this.waitForSAM();
-
-    this.setState({ status: 'running' });
-    console.log('[I2PD] Daemon started successfully');
+      throw err;
+    }
   }
 
   private async waitForSAM(timeout = 60000): Promise<void> {
     const startTime = Date.now();
     const net = require('net');
+
+    console.log('[I2PD] Waiting for SAM bridge...');
 
     while (Date.now() - startTime < timeout) {
       try {
@@ -418,7 +428,6 @@ enabled = true
         console.log('[I2PD] SAM bridge is ready');
         return;
       } catch (e) {
-        // Wait and retry
         await new Promise(r => setTimeout(r, 1000));
       }
     }
@@ -445,14 +454,12 @@ enabled = true
         resolve();
       });
 
-      // Send SIGTERM on Unix, kill on Windows
       if (process.platform === 'win32') {
         spawn('taskkill', ['/pid', this.i2pdProcess.pid!.toString(), '/f']);
       } else {
         this.i2pdProcess.kill('SIGTERM');
       }
 
-      // Force kill after 5 seconds
       setTimeout(() => {
         if (this.i2pdProcess) {
           this.i2pdProcess.kill('SIGKILL');
@@ -465,6 +472,3 @@ enabled = true
     return this.i2pdProcess !== null && this.state.status === 'running';
   }
 }
-
-// Singleton
-export const i2pdManager = new I2PDManager();

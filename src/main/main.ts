@@ -297,10 +297,11 @@ function setupIPC(): void {
   ipcMain.handle('peers:list', async () => {
     const dbPeers = PeerOps.getAll() as any[];
     // Check which peers we've seen recently (within last 5 minutes)
-    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    // Note: lastSeen is stored as Unix timestamp in seconds, not milliseconds
+    const fiveMinutesAgoInSeconds = Math.floor(Date.now() / 1000) - 5 * 60;
     return dbPeers.map(p => ({
       ...p,
-      isOnline: p.lastSeen > fiveMinutesAgo
+      isOnline: p.lastSeen > fiveMinutesAgoInSeconds
     }));
   });
 
