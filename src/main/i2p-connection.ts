@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { I2PSAMRaw, createLocalDestination, toB32 } from '@diva.exchange/i2p-sam';
+import { createRaw, createLocalDestination, toB32 } from '@diva.exchange/i2p-sam';
 
 interface I2PConfig {
   samHost: string;
@@ -57,7 +57,7 @@ export class I2PConnection extends EventEmitter {
 
       // Now create the RAW session for datagram communication
       console.log('[I2P] Creating RAW session...');
-      this.sam = await I2PSAMRaw({
+      this.sam = await createRaw({
         sam: {
           host: this.config.samHost,
           portTCP: this.config.samPortTCP,
@@ -67,15 +67,22 @@ export class I2PConnection extends EventEmitter {
         },
         listen: {
           address: '127.0.0.1',
-          port: this.config.listenPort || 7660 + Math.floor(Math.random() * 100),
-          onMessage: (msg: Buffer) => {
-            this.handleIncomingData(msg);
-          },
-          onClose: () => {
-            console.log('[I2P] Session closed');
-            this.handleDisconnect();
-          }
+          port: this.config.listenPort || 7660 + Math.floor(Math.random() * 100)
         }
+      });
+
+      // Set up event handlers for the new API
+      this.sam.on('data', (msg: Buffer) => {
+        this.handleIncomingData(msg);
+      });
+
+      this.sam.on('close', () => {
+        console.log('[I2P] Session closed');
+        this.handleDisconnect();
+      });
+
+      this.sam.on('error', (error: Error) => {
+        console.error('[I2P] Session error:', error.message);
       });
 
       console.log('[I2P] RAW session created successfully');
@@ -216,6 +223,15 @@ export class I2PConnection extends EventEmitter {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+
+    // Properly close the SAM session
+    if (this.sam) {
+      try {
+        this.sam.close();
+      } catch (e) {
+        // Ignore close errors
+      }
     }
 
     this.sam = null;
