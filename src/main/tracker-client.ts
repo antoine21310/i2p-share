@@ -12,7 +12,7 @@ interface TrackerPeer {
 }
 
 interface TrackerMessage {
-  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG';
+  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG' | 'DISCONNECT';
   payload: any;
   timestamp: number;
   _from?: string;
@@ -109,6 +109,15 @@ export class TrackerClient extends EventEmitter {
   setStreamingDestination(destination: string): void {
     this.streamingDestination = destination;
     console.log(`[TrackerClient] Streaming destination set: ${destination.substring(0, 30)}...`);
+  }
+
+  setDisplayName(name: string): void {
+    this.displayName = name || 'I2P Share User';
+    console.log(`[TrackerClient] Display name set: ${this.displayName}`);
+  }
+
+  getDisplayName(): string {
+    return this.displayName;
   }
 
   updateStats(filesCount: number, totalSize: number): void {
@@ -347,13 +356,38 @@ export class TrackerClient extends EventEmitter {
     const peers = payload.peers || [];
     console.log(`[TrackerClient] Received ${peers.length} peers from tracker`);
 
+    // Track which peers are in the current list
+    const currentPeerKeys = new Set<string>();
+
     for (const peer of peers) {
-      const isNew = !this.knownPeers.has(peer.destination);
-      this.knownPeers.set(peer.destination, peer);
+      // Use b32Address as the key to deduplicate peers across sessions
+      // (same peer reconnecting gets a new destination but same b32Address)
+      const key = peer.b32Address || peer.destination;
+      currentPeerKeys.add(key);
+
+      const existing = this.knownPeers.get(key);
+      const isNew = !existing;
+
+      // Update peer info (this also updates destination if peer reconnected)
+      this.knownPeers.set(key, {
+        ...peer,
+        lastSeen: Date.now()
+      } as TrackerPeer & { lastSeen: number });
 
       if (isNew) {
         console.log(`[TrackerClient] New peer discovered: ${peer.b32Address.substring(0, 16)}...`);
         this.emit('peer:discovered', peer);
+      }
+    }
+
+    // Remove peers that haven't been seen in the last 3 refresh cycles (stale)
+    const staleThreshold = this.config.refreshInterval * 3;
+    const now = Date.now();
+    for (const [key, peer] of this.knownPeers.entries()) {
+      const peerWithTime = peer as TrackerPeer & { lastSeen?: number };
+      if (peerWithTime.lastSeen && now - peerWithTime.lastSeen > staleThreshold) {
+        console.log(`[TrackerClient] Removing stale peer: ${key.substring(0, 16)}...`);
+        this.knownPeers.delete(key);
       }
     }
 
@@ -368,10 +402,29 @@ export class TrackerClient extends EventEmitter {
     return this.knownPeers.size;
   }
 
-  disconnect(): void {
+  async disconnect(): Promise<void> {
+    // Send DISCONNECT message to tracker before disconnecting
+    if (this.isConnected && this.sendMessage && this.activeTrackerIndex >= 0) {
+      const trackerAddr = this.config.trackerAddresses[this.activeTrackerIndex];
+      if (trackerAddr) {
+        console.log('[TrackerClient] Sending DISCONNECT to tracker...');
+        const message: TrackerMessage = {
+          type: 'DISCONNECT',
+          payload: {},
+          timestamp: Date.now()
+        };
+        try {
+          await this.sendMessage(trackerAddr, message);
+        } catch (e) {
+          // Ignore errors when disconnecting
+        }
+      }
+    }
+
     this.stopPeriodicTasks();
     this.isConnected = false;
     this.activeTrackerIndex = -1;
+    this.knownPeers.clear();
     console.log('[TrackerClient] Disconnected from tracker');
   }
 

@@ -3,6 +3,9 @@ import { useStore } from '../store';
 
 export function SettingsPage() {
   const { networkStatus } = useStore();
+  const [displayName, setDisplayName] = useState('');
+  const [displayNameSaving, setDisplayNameSaving] = useState(false);
+  const [displayNameSaved, setDisplayNameSaved] = useState(false);
   const [trackerAddresses, setTrackerAddresses] = useState('');
   const [activeTracker, setActiveTracker] = useState<string | null>(null);
   const [trackerSaving, setTrackerSaving] = useState(false);
@@ -19,13 +22,25 @@ export function SettingsPage() {
     anonymousReporting: true,
   });
 
-  // Load tracker addresses on mount
+  // Load settings on mount
   useEffect(() => {
+    window.electron.getDisplayName().then(setDisplayName);
     window.electron.getTrackerAddresses().then((addresses: string[]) => {
       setTrackerAddresses(addresses.join('\n'));
     });
     window.electron.getActiveTracker().then(setActiveTracker);
   }, []);
+
+  const handleSaveDisplayName = async () => {
+    setDisplayNameSaving(true);
+    try {
+      await window.electron.setDisplayName(displayName);
+      setDisplayNameSaved(true);
+      setTimeout(() => setDisplayNameSaved(false), 2000);
+    } finally {
+      setDisplayNameSaving(false);
+    }
+  };
 
   const handleConnect = async () => {
     await window.electron.connect();
@@ -60,6 +75,46 @@ export function SettingsPage() {
           <h1 className="text-2xl font-bold text-white mb-2">Settings</h1>
           <p className="text-dark-400">Configure your I2P Share preferences</p>
         </div>
+
+        {/* Profile Section */}
+        <section className="mb-8">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <svg className="w-5 h-5 text-primary-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+            </svg>
+            Profile
+          </h2>
+          <div className="card p-6 space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-dark-300 mb-2">
+                Display Name
+              </label>
+              <p className="text-xs text-dark-500 mb-2">
+                This name is visible to other peers on the network.
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="I2P Share User"
+                  className="flex-1 bg-dark-800 text-dark-100 border border-dark-600 rounded-lg px-3 py-2 placeholder-dark-500"
+                  maxLength={32}
+                />
+                <button
+                  onClick={handleSaveDisplayName}
+                  disabled={displayNameSaving}
+                  className="btn btn-primary"
+                >
+                  {displayNameSaving ? 'Saving...' : displayNameSaved ? 'Saved!' : 'Save'}
+                </button>
+              </div>
+              <p className="text-xs text-dark-500 mt-1">
+                Max 32 characters
+              </p>
+            </div>
+          </div>
+        </section>
 
         {/* Network Section */}
         <section className="mb-8">

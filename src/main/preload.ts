@@ -40,6 +40,10 @@ interface ElectronAPI {
   getTrackerAddress: () => Promise<string>;
   setTrackerAddress: (address: string) => Promise<{ success: boolean }>;
 
+  // Profile
+  getDisplayName: () => Promise<string>;
+  setDisplayName: (name: string) => Promise<{ success: boolean }>;
+
   // Window controls
   minimizeWindow: () => Promise<void>;
   maximizeWindow: () => Promise<void>;
@@ -117,6 +121,12 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('tracker:get-address'),
   setTrackerAddress: (address: string) =>
     ipcRenderer.invoke('tracker:set-address', address),
+
+  // Profile
+  getDisplayName: () =>
+    ipcRenderer.invoke('profile:get-display-name'),
+  setDisplayName: (name: string) =>
+    ipcRenderer.invoke('profile:set-display-name', name),
 
   // Window controls
   minimizeWindow: () =>

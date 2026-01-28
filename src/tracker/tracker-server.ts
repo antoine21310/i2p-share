@@ -24,7 +24,7 @@ interface TrackerConfig {
 }
 
 interface TrackerMessage {
-  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG';
+  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG' | 'DISCONNECT';
   payload: any;
   timestamp: number;
 }
@@ -283,8 +283,19 @@ export class TrackerServer extends EventEmitter {
       case 'PING':
         this.handlePing(from);
         break;
+      case 'DISCONNECT':
+        this.handleDisconnect(from);
+        break;
       default:
         console.log('[Tracker] Unknown message type:', message.type);
+    }
+  }
+
+  private handleDisconnect(from: string): void {
+    const b32 = toB32(from);
+    if (this.peers.has(from)) {
+      this.peers.delete(from);
+      console.log(`[Tracker] Peer disconnected: ${b32.substring(0, 16)}...`);
     }
   }
 

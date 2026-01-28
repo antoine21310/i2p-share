@@ -19,7 +19,8 @@ const USE_STREAMING = true;
 // Configuration store
 const store = new Store({
   defaults: {
-    trackerAddresses: [] as string[] // List of tracker addresses for redundancy
+    trackerAddresses: [] as string[], // List of tracker addresses for redundancy
+    displayName: 'I2P Share User' // User's display name visible to other peers
   }
 });
 
@@ -458,6 +459,23 @@ function setupIPC(): void {
 
     return { success: true };
   });
+
+  // User profile settings
+  ipcMain.handle('profile:get-display-name', async () => {
+    return store.get('displayName', 'I2P Share User');
+  });
+
+  ipcMain.handle('profile:set-display-name', async (_event, name: string) => {
+    const displayName = name.trim() || 'I2P Share User';
+    store.set('displayName', displayName);
+    // Update tracker client with new display name
+    trackerClient.setDisplayName(displayName);
+    // Re-announce to tracker with new name if connected
+    if (i2pConnection.isReady()) {
+      trackerClient.announce();
+    }
+    return { success: true };
+  });
 }
 
 async function connectToTracker(myDestination: string): Promise<void> {
@@ -475,7 +493,8 @@ async function connectToTracker(myDestination: string): Promise<void> {
 
   // Set up tracker client with all addresses
   trackerClient.setTrackerAddresses(trackerAddresses);
-  trackerClient.setIdentity(myDestination);
+  const storedDisplayName = store.get('displayName', 'I2P Share User') as string;
+  trackerClient.setIdentity(myDestination, storedDisplayName);
   trackerClient.setMessageHandler(async (dest, msg) => {
     console.log(`[Main] Sending message to ${dest.substring(0, 30)}...: ${msg.type}`);
     const result = await i2pConnection.sendMessage(dest, msg);
@@ -892,6 +911,9 @@ app.on('before-quit', async () => {
   if (USE_STREAMING) {
     await streamingServer.stop();
   }
+
+  // Notify tracker that we're disconnecting (so other peers are updated)
+  await trackerClient.disconnect();
 
   // Disconnect from I2P (but keep i2pd running for tracker)
   await i2pConnection.disconnect();

@@ -483,15 +483,30 @@ enabled = true
         res.on('end', () => {
           try {
             // Parse the HTML response to count tunnels
-            // Look for patterns like "Inbound tunnels:" and count rows
-            const inboundMatch = data.match(/Inbound tunnels:.*?(\d+)/i);
-            const outboundMatch = data.match(/Outbound tunnels:.*?(\d+)/i);
-            const transitMatch = data.match(/Transit tunnels:.*?(\d+)/i);
+            // The format is: <b>Inbound tunnels:</b> followed by <div class="listitem"> entries
+            // Then <b>Outbound tunnels:</b> followed by more entries
+
+            // Find the sections
+            const inboundStart = data.indexOf('Inbound tunnels:');
+            const outboundStart = data.indexOf('Outbound tunnels:');
+
+            let inboundCount = 0;
+            let outboundCount = 0;
+
+            if (inboundStart !== -1 && outboundStart !== -1) {
+              // Count listitem entries between Inbound and Outbound
+              const inboundSection = data.substring(inboundStart, outboundStart);
+              inboundCount = (inboundSection.match(/class="listitem"/g) || []).length;
+
+              // Count listitem entries after Outbound
+              const outboundSection = data.substring(outboundStart);
+              outboundCount = (outboundSection.match(/class="listitem"/g) || []).length;
+            }
 
             resolve({
-              inbound: inboundMatch ? parseInt(inboundMatch[1]) : 0,
-              outbound: outboundMatch ? parseInt(outboundMatch[1]) : 0,
-              transit: transitMatch ? parseInt(transitMatch[1]) : 0
+              inbound: inboundCount,
+              outbound: outboundCount,
+              transit: 0 // Transit tunnels are on a separate page
             });
           } catch (e) {
             resolve(defaultStats);
