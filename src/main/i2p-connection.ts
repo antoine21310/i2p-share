@@ -48,10 +48,14 @@ export class I2PConnection extends EventEmitter {
         }
       });
 
-      this.destination = destInfo.address;
+      // Note: In i2p-sam library:
+      // - destInfo.public = full I2P destination (base64, ~400 chars)
+      // - destInfo.address = b32 address (short hash)
+      // We need the FULL destination for SAM communication
+      this.destination = destInfo.public;
       this.publicKey = destInfo.public;
       this.privateKey = destInfo.private;
-      this.b32Address = toB32(this.destination);
+      this.b32Address = destInfo.address;
 
       console.log('[I2P] Destination created:', this.b32Address);
 

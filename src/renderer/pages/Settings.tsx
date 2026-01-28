@@ -138,14 +138,14 @@ export function SettingsPage() {
                 Tracker Addresses
               </label>
               <p className="text-xs text-dark-500 mb-2">
-                Enter I2P tracker addresses (.b32.i2p), one per line.
+                Enter full I2P destination addresses (from tracker), one per line.
                 A random tracker will be selected for anti-censorship.
               </p>
               <textarea
                 value={trackerAddresses}
                 onChange={(e) => setTrackerAddresses(e.target.value)}
-                placeholder="tracker1.b32.i2p&#10;tracker2.b32.i2p&#10;tracker3.b32.i2p"
-                className="w-full h-24 font-mono text-sm resize-none"
+                placeholder="Full destination from tracker (long base64 string ending in AAAA)"
+                className="w-full h-24 font-mono text-sm resize-none bg-dark-800 text-dark-100 border border-dark-600 rounded-lg p-3 placeholder-dark-500"
                 rows={4}
               />
               <div className="flex justify-between items-center mt-2">
