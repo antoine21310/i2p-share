@@ -547,18 +547,27 @@ function setupEventForwarding(): void {
   });
 
   // Forward tracker client events - save discovered peers to database
+  // NOTE: These are the main handlers, don't duplicate below
   trackerClient.on('peer:discovered', (peer) => {
     console.log(`[Main] Tracker discovered peer: ${peer.displayName} (${peer.b32Address.substring(0, 16)}...)`);
+
+    // Save to database
     PeerOps.upsert({
       peerId: peer.destination,
       displayName: peer.displayName,
       filesCount: peer.filesCount,
       totalSize: peer.totalSize
     });
+
+    // Add to DHT routing table for future communication
+    const crypto = require('crypto');
+    const nodeId = crypto.createHash('sha1').update(peer.destination).digest('hex');
+    dhtSearch.updateNode(nodeId, peer.destination);
+
     mainWindow?.webContents.send('peer:discovered', peer);
 
-    // Request files from this new peer
-    requestFilesFromPeer(peer.destination);
+    // Request files from this new peer (with small delay to let connection stabilize)
+    setTimeout(() => requestFilesFromPeer(peer.destination), 500);
   });
 
   trackerClient.on('peers:updated', (peers) => {
@@ -572,10 +581,16 @@ function setupEventForwarding(): void {
         totalSize: peer.totalSize
       });
 
+      // Add to DHT routing table
+      const crypto = require('crypto');
+      const nodeId = crypto.createHash('sha1').update(peer.destination).digest('hex');
+      dhtSearch.updateNode(nodeId, peer.destination);
+
       // Request files from each peer (will get fresh list)
-      requestFilesFromPeer(peer.destination);
+      setTimeout(() => requestFilesFromPeer(peer.destination), 500);
     }
     mainWindow?.webContents.send('peers:updated', peers);
+    mainWindow?.webContents.send('tracker:peers-updated', peers);
   });
 
   // Forward I2P connection events
@@ -599,40 +614,30 @@ function setupEventForwarding(): void {
   });
 
   i2pConnection.on('message', ({ from, message }) => {
+    // Log ALL incoming messages for debugging
+    const fromShort = from.substring(0, 30);
+    console.log(`[Main] Received message type=${message?.type} from ${fromShort}...`);
+
     // First check if it's a tracker message
     const isTrackerMessage = trackerClient.handleMessage(from, message);
-    if (isTrackerMessage) return;
+    if (isTrackerMessage) {
+      console.log(`[Main] -> Handled as tracker message`);
+      return;
+    }
 
     // Check if it's a P2P file exchange message
     const isP2PMessage = handleP2PMessage(from, message);
-    if (isP2PMessage) return;
+    if (isP2PMessage) {
+      console.log(`[Main] -> Handled as P2P message`);
+      return;
+    }
 
     // Otherwise route to DHT handler
+    console.log(`[Main] -> Routing to DHT handler`);
     dhtSearch.handleMessage(from, message);
   });
 
-  // Forward tracker events
-  trackerClient.on('peer:discovered', (peer) => {
-    console.log('[Main] New peer from tracker:', peer.b32Address.substring(0, 16) + '...');
-
-    // Add to DHT routing table for future communication
-    const nodeId = require('crypto').createHash('sha1').update(peer.destination).digest('hex');
-    dhtSearch.updateNode(nodeId, peer.destination);
-
-    // Save to database
-    PeerOps.upsert({
-      peerId: peer.destination,
-      displayName: peer.displayName,
-      filesCount: peer.filesCount,
-      totalSize: peer.totalSize
-    });
-
-    mainWindow?.webContents.send('peer:discovered', peer);
-  });
-
-  trackerClient.on('peers:updated', (peers) => {
-    mainWindow?.webContents.send('tracker:peers-updated', peers);
-  });
+  // Note: tracker event handlers are defined above, no duplicates needed here
 
   // Forward i2pd manager events
   i2pdManager.on('state', (state) => {
