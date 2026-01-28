@@ -26,6 +26,9 @@ interface ElectronAPI {
 
   // Peers
   getPeers: () => Promise<any[]>;
+  getPeerFiles: (peerId: string) => Promise<any[]>;
+  requestPeerFiles: (peerId: string) => Promise<{ success: boolean }>;
+  getAllRemoteFiles: () => Promise<any[]>;
 
   // Tracker
   getTrackerAddresses: () => Promise<string[]>;
@@ -91,6 +94,12 @@ const api: ElectronAPI = {
   // Peers
   getPeers: () =>
     ipcRenderer.invoke('peers:list'),
+  getPeerFiles: (peerId: string) =>
+    ipcRenderer.invoke('peers:get-files', peerId),
+  requestPeerFiles: (peerId: string) =>
+    ipcRenderer.invoke('peers:request-files', peerId),
+  getAllRemoteFiles: () =>
+    ipcRenderer.invoke('remote-files:all'),
 
   // Tracker
   getTrackerAddresses: () =>

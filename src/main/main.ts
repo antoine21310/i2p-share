@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import path from 'path';
 import Store from 'electron-store';
-import { initDatabase, closeDatabase, FileOps, SharedFolderOps, PeerOps } from './database';
+import { initDatabase, closeDatabase, FileOps, SharedFolderOps, PeerOps, RemoteFileOps } from './database';
 import { fileIndexer } from './file-indexer';
 import { dhtSearch } from './dht-search';
 import { fileServer } from './file-server';
@@ -69,6 +69,17 @@ function setupIPC(): void {
       addedAt: f.sharedAt
     }));
 
+    // Search remote files from peers (cached in database)
+    const remoteResults = RemoteFileOps.search(query).map((f: any) => ({
+      filename: f.filename,
+      fileHash: f.hash,
+      size: f.size,
+      mimeType: f.mimeType,
+      peerId: f.peerId,
+      peerDisplayName: f.peerName || 'Unknown Peer',
+      addedAt: f.lastUpdated
+    }));
+
     // DHT search for remote peers (only if connected to I2P)
     let dhtResults: SearchResult[] = [];
     if (i2pConnection.isReady()) {
@@ -81,7 +92,31 @@ function setupIPC(): void {
       console.log('[IPC] Skipping DHT search - not connected to I2P');
     }
 
-    return [...localResults, ...dhtResults];
+    // Deduplicate by fileHash (prefer local > remote > DHT)
+    const seen = new Set<string>();
+    const results: SearchResult[] = [];
+
+    for (const r of localResults) {
+      if (!seen.has(r.fileHash)) {
+        seen.add(r.fileHash);
+        results.push(r);
+      }
+    }
+    for (const r of remoteResults) {
+      if (!seen.has(r.fileHash)) {
+        seen.add(r.fileHash);
+        results.push(r);
+      }
+    }
+    for (const r of dhtResults) {
+      if (!seen.has(r.fileHash)) {
+        seen.add(r.fileHash);
+        results.push(r);
+      }
+    }
+
+    console.log(`[IPC] Search results: ${localResults.length} local, ${remoteResults.length} remote, ${dhtResults.length} DHT`);
+    return results;
   });
 
   // Downloads
@@ -269,6 +304,19 @@ function setupIPC(): void {
     }));
   });
 
+  ipcMain.handle('peers:get-files', async (_event, peerId: string) => {
+    return RemoteFileOps.getByPeer(peerId);
+  });
+
+  ipcMain.handle('peers:request-files', async (_event, peerId: string) => {
+    await requestFilesFromPeer(peerId);
+    return { success: true };
+  });
+
+  ipcMain.handle('remote-files:all', async () => {
+    return RemoteFileOps.getAll();
+  });
+
   // Window controls
   ipcMain.handle('window:minimize', () => {
     mainWindow?.minimize();
@@ -385,6 +433,73 @@ async function connectToTracker(myDestination: string): Promise<void> {
   }
 }
 
+// P2P file exchange protocol
+function handleP2PMessage(from: string, message: any): boolean {
+  if (!message || !message.type) return false;
+
+  switch (message.type) {
+    case 'GET_FILES':
+      handleGetFilesRequest(from);
+      return true;
+    case 'FILES_LIST':
+      handleFilesListResponse(from, message.payload);
+      return true;
+    default:
+      return false;
+  }
+}
+
+function handleGetFilesRequest(from: string): void {
+  console.log(`[P2P] Received GET_FILES request from ${from.substring(0, 30)}...`);
+
+  // Get our shared files
+  const files = fileIndexer.getAllFiles();
+  const filesList = files.map((f: any) => ({
+    filename: f.filename,
+    hash: f.hash,
+    size: f.size,
+    mimeType: f.mimeType
+  }));
+
+  // Send response
+  const response = {
+    type: 'FILES_LIST',
+    payload: { files: filesList },
+    timestamp: Date.now()
+  };
+
+  i2pConnection.sendMessage(from, response);
+  console.log(`[P2P] Sent FILES_LIST with ${filesList.length} files to ${from.substring(0, 30)}...`);
+}
+
+function handleFilesListResponse(from: string, payload: any): void {
+  const files = payload?.files || [];
+  console.log(`[P2P] Received FILES_LIST with ${files.length} files from ${from.substring(0, 30)}...`);
+
+  if (files.length === 0) return;
+
+  // Save to database
+  RemoteFileOps.upsertBatch(from, files);
+  console.log(`[P2P] Saved ${files.length} remote files to database`);
+
+  // Notify UI
+  mainWindow?.webContents.send('remote-files:updated', { peerId: from, files });
+}
+
+async function requestFilesFromPeer(peerDestination: string): Promise<void> {
+  if (!i2pConnection.isReady()) return;
+
+  console.log(`[P2P] Requesting files from peer ${peerDestination.substring(0, 30)}...`);
+
+  const message = {
+    type: 'GET_FILES',
+    payload: {},
+    timestamp: Date.now()
+  };
+
+  await i2pConnection.sendMessage(peerDestination, message);
+}
+
 function setupEventForwarding(): void {
   // Forward file indexer events
   fileIndexer.on('scan:progress', (data) => {
@@ -430,6 +545,38 @@ function setupEventForwarding(): void {
     });
   });
 
+  // Forward tracker client events - save discovered peers to database
+  trackerClient.on('peer:discovered', (peer) => {
+    console.log(`[Main] Tracker discovered peer: ${peer.displayName} (${peer.b32Address.substring(0, 16)}...)`);
+    PeerOps.upsert({
+      peerId: peer.destination,
+      displayName: peer.displayName,
+      filesCount: peer.filesCount,
+      totalSize: peer.totalSize
+    });
+    mainWindow?.webContents.send('peer:discovered', peer);
+
+    // Request files from this new peer
+    requestFilesFromPeer(peer.destination);
+  });
+
+  trackerClient.on('peers:updated', (peers) => {
+    console.log(`[Main] Tracker peers updated: ${peers.length} peers`);
+    // Update all peers in database and request files
+    for (const peer of peers) {
+      PeerOps.upsert({
+        peerId: peer.destination,
+        displayName: peer.displayName,
+        filesCount: peer.filesCount,
+        totalSize: peer.totalSize
+      });
+
+      // Request files from each peer (will get fresh list)
+      requestFilesFromPeer(peer.destination);
+    }
+    mainWindow?.webContents.send('peers:updated', peers);
+  });
+
   // Forward I2P connection events
   i2pConnection.on('connected', (data) => {
     console.log('[Main] I2P connected:', data.b32Address);
@@ -453,11 +600,14 @@ function setupEventForwarding(): void {
   i2pConnection.on('message', ({ from, message }) => {
     // First check if it's a tracker message
     const isTrackerMessage = trackerClient.handleMessage(from, message);
+    if (isTrackerMessage) return;
 
-    // If not a tracker message, route to DHT handler
-    if (!isTrackerMessage) {
-      dhtSearch.handleMessage(from, message);
-    }
+    // Check if it's a P2P file exchange message
+    const isP2PMessage = handleP2PMessage(from, message);
+    if (isP2PMessage) return;
+
+    // Otherwise route to DHT handler
+    dhtSearch.handleMessage(from, message);
   });
 
   // Forward tracker events

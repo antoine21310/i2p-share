@@ -125,6 +125,22 @@ export function initDatabase(): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_routing_bucket ON routing_table(bucketIndex);
     CREATE INDEX IF NOT EXISTS idx_routing_lastSeen ON routing_table(lastSeen);
+
+    -- Remote files from peers
+    CREATE TABLE IF NOT EXISTS remote_files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      peerId TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      mimeType TEXT,
+      lastUpdated INTEGER DEFAULT (strftime('%s', 'now')),
+      UNIQUE(peerId, hash)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_remote_files_peer ON remote_files(peerId);
+    CREATE INDEX IF NOT EXISTS idx_remote_files_hash ON remote_files(hash);
+    CREATE INDEX IF NOT EXISTS idx_remote_files_filename ON remote_files(filename);
   `;
 
   db.exec(schema);
@@ -387,5 +403,96 @@ export const RoutingOps = {
     const db = getDatabase();
     // Remove nodes with too many failures
     return db.prepare('DELETE FROM routing_table WHERE failCount >= 5').run();
+  }
+};
+
+// Remote file operations (files from peers)
+export const RemoteFileOps = {
+  upsert: (file: {
+    peerId: string;
+    filename: string;
+    hash: string;
+    size: number;
+    mimeType?: string;
+  }) => {
+    const db = getDatabase();
+    return db.prepare(`
+      INSERT INTO remote_files (peerId, filename, hash, size, mimeType, lastUpdated)
+      VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(peerId, hash) DO UPDATE SET
+        filename = ?,
+        size = ?,
+        mimeType = ?,
+        lastUpdated = strftime('%s', 'now')
+    `).run(
+      file.peerId, file.filename, file.hash, file.size, file.mimeType || null,
+      file.filename, file.size, file.mimeType || null
+    );
+  },
+
+  upsertBatch: (peerId: string, files: Array<{
+    filename: string;
+    hash: string;
+    size: number;
+    mimeType?: string;
+  }>) => {
+    const db = getDatabase();
+    const stmt = db.prepare(`
+      INSERT INTO remote_files (peerId, filename, hash, size, mimeType, lastUpdated)
+      VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(peerId, hash) DO UPDATE SET
+        filename = ?,
+        size = ?,
+        mimeType = ?,
+        lastUpdated = strftime('%s', 'now')
+    `);
+
+    const insertMany = db.transaction((files: any[]) => {
+      for (const file of files) {
+        stmt.run(
+          peerId, file.filename, file.hash, file.size, file.mimeType || null,
+          file.filename, file.size, file.mimeType || null
+        );
+      }
+    });
+
+    insertMany(files);
+  },
+
+  getByPeer: (peerId: string) => {
+    const db = getDatabase();
+    return db.prepare('SELECT * FROM remote_files WHERE peerId = ? ORDER BY filename').all(peerId);
+  },
+
+  search: (query: string) => {
+    const db = getDatabase();
+    return db.prepare(`
+      SELECT rf.*, p.displayName as peerName
+      FROM remote_files rf
+      LEFT JOIN peers p ON rf.peerId = p.peerId
+      WHERE rf.filename LIKE ?
+      ORDER BY rf.filename
+    `).all(`%${query}%`);
+  },
+
+  getAll: () => {
+    const db = getDatabase();
+    return db.prepare(`
+      SELECT rf.*, p.displayName as peerName
+      FROM remote_files rf
+      LEFT JOIN peers p ON rf.peerId = p.peerId
+      ORDER BY rf.lastUpdated DESC
+    `).all();
+  },
+
+  deleteByPeer: (peerId: string) => {
+    const db = getDatabase();
+    return db.prepare('DELETE FROM remote_files WHERE peerId = ?').run(peerId);
+  },
+
+  cleanup: (maxAge = 3600) => {
+    const db = getDatabase();
+    const cutoff = Math.floor(Date.now() / 1000) - maxAge;
+    return db.prepare('DELETE FROM remote_files WHERE lastUpdated < ?').run(cutoff);
   }
 };
