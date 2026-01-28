@@ -6,11 +6,33 @@ export function DownloadsPage() {
 
   useEffect(() => {
     fetchDownloads();
-    const interval = setInterval(fetchDownloads, 2000);
-    return () => clearInterval(interval);
+    // Poll more frequently (every 1 second) for better responsiveness
+    const interval = setInterval(fetchDownloads, 1000);
+
+    // Listen for download events to trigger immediate refresh
+    const unsubAdded = window.electron.on('download:added', fetchDownloads);
+    const unsubStarted = window.electron.on('download:started', fetchDownloads);
+    const unsubProgress = window.electron.on('download:progress', fetchDownloads);
+    const unsubPaused = window.electron.on('download:paused', fetchDownloads);
+    const unsubResumed = window.electron.on('download:resumed', fetchDownloads);
+    const unsubCompleted = window.electron.on('download:completed', fetchDownloads);
+    const unsubFailed = window.electron.on('download:failed', fetchDownloads);
+
+    return () => {
+      clearInterval(interval);
+      unsubAdded();
+      unsubStarted();
+      unsubProgress();
+      unsubPaused();
+      unsubResumed();
+      unsubCompleted();
+      unsubFailed();
+    };
   }, []);
 
-  const activeDownloads = downloads.filter(d => ['pending', 'downloading'].includes(d.status));
+  // Include 'connecting' and 'pending' in active downloads
+  const activeDownloads = downloads.filter(d => ['pending', 'connecting', 'downloading'].includes(d.status));
+  const pausedDownloads = downloads.filter(d => d.status === 'paused');
   const completedDownloads = downloads.filter(d => d.status === 'completed');
   const failedDownloads = downloads.filter(d => d.status === 'failed');
 
@@ -41,6 +63,28 @@ export function DownloadsPage() {
                   key={download.id}
                   download={download}
                   onPause={() => pauseDownload(download.id)}
+                  onResume={() => resumeDownload(download.id)}
+                  onCancel={() => cancelDownload(download.id)}
+                />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Paused Downloads */}
+        {pausedDownloads.length > 0 && (
+          <section className="mb-8">
+            <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+              <svg className="w-5 h-5 text-yellow-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              Paused
+            </h2>
+            <div className="space-y-3">
+              {pausedDownloads.map(download => (
+                <DownloadItem
+                  key={download.id}
+                  download={download}
                   onResume={() => resumeDownload(download.id)}
                   onCancel={() => cancelDownload(download.id)}
                 />
@@ -128,6 +172,8 @@ interface DownloadItemProps {
 }
 
 function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemProps) {
+  const isConnecting = download.status === 'connecting';
+  const isPending = download.status === 'pending';
   const isActive = download.status === 'downloading';
   const isPaused = download.status === 'paused';
   const isCompleted = download.status === 'completed';
@@ -146,9 +192,10 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
           w-10 h-10 rounded-lg flex items-center justify-center
           ${isCompleted ? 'bg-green-500/20 text-green-400' : ''}
           ${isActive ? 'bg-primary-500/20 text-primary-400' : ''}
+          ${isConnecting ? 'bg-blue-500/20 text-blue-400' : ''}
+          ${isPending ? 'bg-dark-700 text-dark-400' : ''}
           ${isPaused ? 'bg-yellow-500/20 text-yellow-400' : ''}
           ${isFailed ? 'bg-red-500/20 text-red-400' : ''}
-          ${download.status === 'pending' ? 'bg-dark-700 text-dark-400' : ''}
         `}>
           {isCompleted && (
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -171,9 +218,14 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
           )}
-          {download.status === 'pending' && (
+          {isPending && (
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          )}
+          {isConnecting && (
+            <svg className="w-5 h-5 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
             </svg>
           )}
         </div>
@@ -185,6 +237,12 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
           </h3>
           <div className="flex items-center gap-4 mt-1 text-sm text-dark-400">
             <span>{formatBytes(download.downloadedSize)} / {formatBytes(download.totalSize)}</span>
+            {isConnecting && (
+              <span className="text-blue-400">Connecting to peer...</span>
+            )}
+            {isPending && (
+              <span className="text-dark-500">Waiting...</span>
+            )}
             {isActive && download.speed > 0 && (
               <span className="text-primary-400">{formatSpeed(download.speed)}</span>
             )}

@@ -238,14 +238,16 @@ function setupIPC(): void {
         break;
     }
 
-    // Combine DHT nodes and tracker peers
+    // Use tracker peers count as the primary source (these are actually online)
     const trackerPeersCount = trackerClient.getPeersCount();
-    const totalPeers = Math.max(dhtStats.nodesCount, trackerPeersCount);
+
+    // Get real tunnel count from i2pd (or default to 0)
+    const activeTunnels = i2pState.isConnected ? await i2pdManager.getActiveTunnelCount() : 0;
 
     return {
       isConnected: connectionStatus === 'connected',
-      activeTunnels: i2pState.isConnected ? 12 : 0,
-      peersConnected: totalPeers,
+      activeTunnels,
+      peersConnected: trackerPeersCount, // Only count actual online peers from tracker
       uploadSpeed: uploadStats.totalSpeed,
       downloadSpeed: activeDownloads.reduce((sum, d) => sum + d.speed, 0),
       totalUploaded: 0,
@@ -581,6 +583,15 @@ function setupEventForwarding(): void {
 
   // Forward download events (both streaming and legacy)
   if (USE_STREAMING) {
+    // Notify UI immediately when download is added
+    streamingClient.on('download:added', (data) => {
+      mainWindow?.webContents.send('download:added', data);
+    });
+
+    streamingClient.on('download:started', (data) => {
+      mainWindow?.webContents.send('download:started', data);
+    });
+
     streamingClient.on('download:progress', (data) => {
       mainWindow?.webContents.send('download:progress', data);
     });

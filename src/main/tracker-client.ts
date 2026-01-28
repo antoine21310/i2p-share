@@ -163,14 +163,25 @@ export class TrackerClient extends EventEmitter {
     const tracker = this.config.trackerAddresses[this.activeTrackerIndex];
     console.log(`[TrackerClient] Connecting to tracker ${this.activeTrackerIndex + 1}/${this.config.trackerAddresses.length}: ${tracker.substring(0, 20)}...`);
 
-    // Send initial announcement
-    await this.announce();
+    // Send initial announcements with retry (UDP over I2P can be unreliable)
+    // Send 3 announces with 1 second delay between each
+    for (let i = 0; i < 3; i++) {
+      await this.announce();
+      if (i < 2) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
 
-    // Wait a bit for the announce to be delivered (UDP can be slow over I2P)
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Wait for announce to propagate through I2P network
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // Request peer list
-    await this.requestPeers();
+    // Request peer list (also send multiple times for reliability)
+    for (let i = 0; i < 2; i++) {
+      await this.requestPeers();
+      if (i < 1) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    }
 
     // Start periodic tasks
     this.startPeriodicTasks();
@@ -184,9 +195,11 @@ export class TrackerClient extends EventEmitter {
   private startPeriodicTasks(): void {
     this.stopPeriodicTasks();
 
-    // Announce periodically
-    this.announceTimer = setInterval(() => {
-      this.announce();
+    // Announce periodically (send twice for UDP reliability)
+    this.announceTimer = setInterval(async () => {
+      await this.announce();
+      // Send again after a short delay for reliability
+      setTimeout(() => this.announce(), 500);
     }, this.config.announceInterval);
 
     // Refresh peer list periodically

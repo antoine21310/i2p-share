@@ -464,6 +464,54 @@ enabled = true
   isRunning(): boolean {
     return this.i2pdProcess !== null && this.state.status === 'running';
   }
+
+  // Get tunnel statistics from i2pd HTTP API
+  async getTunnelStats(): Promise<{ inbound: number; outbound: number; transit: number }> {
+    const http = require('http');
+
+    return new Promise((resolve) => {
+      const defaultStats = { inbound: 0, outbound: 0, transit: 0 };
+
+      const req = http.get('http://127.0.0.1:7070/?page=tunnels', { timeout: 2000 }, (res: any) => {
+        if (res.statusCode !== 200) {
+          resolve(defaultStats);
+          return;
+        }
+
+        let data = '';
+        res.on('data', (chunk: string) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            // Parse the HTML response to count tunnels
+            // Look for patterns like "Inbound tunnels:" and count rows
+            const inboundMatch = data.match(/Inbound tunnels:.*?(\d+)/i);
+            const outboundMatch = data.match(/Outbound tunnels:.*?(\d+)/i);
+            const transitMatch = data.match(/Transit tunnels:.*?(\d+)/i);
+
+            resolve({
+              inbound: inboundMatch ? parseInt(inboundMatch[1]) : 0,
+              outbound: outboundMatch ? parseInt(outboundMatch[1]) : 0,
+              transit: transitMatch ? parseInt(transitMatch[1]) : 0
+            });
+          } catch (e) {
+            resolve(defaultStats);
+          }
+        });
+      });
+
+      req.on('error', () => resolve(defaultStats));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(defaultStats);
+      });
+    });
+  }
+
+  // Get total active tunnel count
+  async getActiveTunnelCount(): Promise<number> {
+    const stats = await this.getTunnelStats();
+    return stats.inbound + stats.outbound;
+  }
 }
 
 // Singleton
