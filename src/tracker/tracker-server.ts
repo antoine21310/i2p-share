@@ -272,14 +272,27 @@ export class TrackerServer extends EventEmitter {
   }
 
   private handleGetPeers(from: string): void {
-    console.log(`[Tracker] Peer list requested by ${toB32(from).substring(0, 16)}...`);
-    this.sendPeersList(from);
+    const b32 = toB32(from);
+    console.log(`[Tracker] Peer list requested by ${b32.substring(0, 16)}...`);
 
-    // Update last seen if peer exists
-    const peer = this.peers.get(from);
-    if (peer) {
+    // Auto-register peer if not already known (they may have missed the ANNOUNCE)
+    let peer = this.peers.get(from);
+    if (!peer) {
+      console.log(`[Tracker] Auto-registering unknown peer: ${b32.substring(0, 16)}...`);
+      peer = {
+        destination: from,
+        b32Address: b32,
+        displayName: 'Unknown',
+        filesCount: 0,
+        totalSize: 0,
+        lastSeen: Date.now()
+      };
+      this.peers.set(from, peer);
+    } else {
       peer.lastSeen = Date.now();
     }
+
+    this.sendPeersList(from);
   }
 
   private handlePing(from: string): void {

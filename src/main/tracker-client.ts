@@ -159,6 +159,9 @@ export class TrackerClient extends EventEmitter {
     // Send initial announcement
     await this.announce();
 
+    // Wait a bit for the announce to be delivered (UDP can be slow over I2P)
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
     // Request peer list
     await this.requestPeers();
 
