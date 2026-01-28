@@ -1,6 +1,16 @@
 import { EventEmitter } from 'events';
 import { toB32 } from '@diva.exchange/i2p-sam';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { app } from 'electron';
+import {
+  generateSigningKeypair,
+  createSignedMessage,
+  verifySignedMessage,
+  SignedMessage,
+  SigningKeypair
+} from '../shared/utils';
 
 interface TrackerPeer {
   destination: string;
@@ -9,6 +19,7 @@ interface TrackerPeer {
   filesCount: number;
   totalSize: number;
   streamingDestination?: string; // Destination for I2P streaming file transfers
+  signingKey?: string; // Public key for message verification
 }
 
 interface TrackerMessage {
@@ -47,6 +58,8 @@ export class TrackerClient extends EventEmitter {
   private activeTrackerIndex: number = -1;
   private failedTrackers: Set<number> = new Set();
   private lastResponseTime: Map<string, number> = new Map();
+  private signingKeys: SigningKeypair | null = null;
+  private usedNonces: Set<string> = new Set(); // Replay attack protection
 
   constructor(config: Partial<TrackerClientConfig> = {}) {
     super();
@@ -56,6 +69,51 @@ export class TrackerClient extends EventEmitter {
       refreshInterval: config.refreshInterval || 60 * 1000,
       connectionTimeout: config.connectionTimeout || 30 * 1000
     };
+
+    // Load or generate signing keys
+    this.initSigningKeys();
+
+    // Cleanup nonces periodically
+    setInterval(() => {
+      this.usedNonces.clear();
+    }, 10 * 60 * 1000); // Every 10 minutes
+  }
+
+  private getSigningKeysPath(): string {
+    const userDataPath = app?.getPath('userData') || process.cwd();
+    return path.join(userDataPath, 'signing-keys.json');
+  }
+
+  private initSigningKeys(): void {
+    try {
+      const keysPath = this.getSigningKeysPath();
+
+      if (fs.existsSync(keysPath)) {
+        const data = fs.readFileSync(keysPath, 'utf-8');
+        this.signingKeys = JSON.parse(data) as SigningKeypair;
+        console.log('[TrackerClient] Loaded signing keys');
+      } else {
+        // Generate new keys
+        console.log('[TrackerClient] Generating new signing keys...');
+        this.signingKeys = generateSigningKeypair();
+
+        // Save keys
+        const keysDir = path.dirname(keysPath);
+        if (!fs.existsSync(keysDir)) {
+          fs.mkdirSync(keysDir, { recursive: true });
+        }
+        fs.writeFileSync(keysPath, JSON.stringify(this.signingKeys, null, 2));
+        console.log('[TrackerClient] Signing keys generated and saved');
+      }
+    } catch (error: any) {
+      console.error('[TrackerClient] Failed to initialize signing keys:', error.message);
+      // Generate in-memory keys as fallback
+      this.signingKeys = generateSigningKeypair();
+    }
+  }
+
+  getSigningPublicKey(): string | null {
+    return this.signingKeys?.publicKey || null;
   }
 
   // Set tracker addresses (replaces the list)
@@ -172,25 +230,15 @@ export class TrackerClient extends EventEmitter {
     const tracker = this.config.trackerAddresses[this.activeTrackerIndex];
     console.log(`[TrackerClient] Connecting to tracker ${this.activeTrackerIndex + 1}/${this.config.trackerAddresses.length}: ${tracker.substring(0, 20)}...`);
 
-    // Send initial announcements with retry (UDP over I2P can be unreliable)
-    // Send 3 announces with 1 second delay between each
-    for (let i = 0; i < 3; i++) {
-      await this.announce();
-      if (i < 2) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+    // Send initial announce with exponential backoff retry
+    // Only retry if we don't get a response (tracked by lastResponseTime)
+    await this.announce();
 
-    // Wait for announce to propagate through I2P network
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // Wait for I2P network latency (I2P has high latency due to tunnel encryption)
+    await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Request peer list (also send multiple times for reliability)
-    for (let i = 0; i < 2; i++) {
-      await this.requestPeers();
-      if (i < 1) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
-      }
-    }
+    // Request peer list - the response also confirms announce was received
+    await this.requestPeers();
 
     // Start periodic tasks
     this.startPeriodicTasks();
@@ -204,18 +252,24 @@ export class TrackerClient extends EventEmitter {
   private startPeriodicTasks(): void {
     this.stopPeriodicTasks();
 
-    // Announce periodically (send twice for UDP reliability)
+    // Add jitter to prevent thundering herd (±10% of interval)
+    const addJitter = (interval: number) => {
+      const jitter = interval * 0.1 * (Math.random() - 0.5);
+      return Math.round(interval + jitter);
+    };
+
+    // Announce periodically with jitter
+    // Single announce is sufficient - if tracker doesn't respond,
+    // health check will trigger a re-announce or tracker switch
     this.announceTimer = setInterval(async () => {
       await this.announce();
-      // Send again after a short delay for reliability
-      setTimeout(() => this.announce(), 500);
-    }, this.config.announceInterval);
+    }, addJitter(this.config.announceInterval));
 
-    // Refresh peer list periodically
+    // Refresh peer list periodically with jitter
     this.refreshTimer = setInterval(() => {
       this.requestPeers();
       this.checkTrackerHealth();
-    }, this.config.refreshInterval);
+    }, addJitter(this.config.refreshInterval));
   }
 
   private stopPeriodicTasks(): void {
@@ -237,11 +291,17 @@ export class TrackerClient extends EventEmitter {
     const lastResponse = this.lastResponseTime.get(tracker) || 0;
     const timeSinceResponse = Date.now() - lastResponse;
 
-    // If no response in 3x announce interval, try another tracker
-    if (lastResponse > 0 && timeSinceResponse > this.config.announceInterval * 3) {
-      console.log(`[TrackerClient] Tracker not responding, switching...`);
-      this.failedTrackers.add(this.activeTrackerIndex);
-      await this.switchTracker();
+    // If no response in 2x refresh interval, try re-announcing first
+    if (lastResponse > 0 && timeSinceResponse > this.config.refreshInterval * 2) {
+      console.log(`[TrackerClient] Tracker not responding, attempting re-announce...`);
+      await this.announce();
+
+      // If still no response after 3x refresh interval, switch trackers
+      if (timeSinceResponse > this.config.refreshInterval * 3) {
+        console.log(`[TrackerClient] Tracker still not responding, switching...`);
+        this.failedTrackers.add(this.activeTrackerIndex);
+        await this.switchTracker();
+      }
     }
   }
 
@@ -252,15 +312,42 @@ export class TrackerClient extends EventEmitter {
 
     if (this.activeTrackerIndex < 0 || this.activeTrackerIndex === oldTracker) {
       console.log('[TrackerClient] No alternative trackers available');
+      // Clear failed trackers to allow retry
+      if (this.config.trackerAddresses.length > 0) {
+        console.log('[TrackerClient] Clearing failed tracker list for retry');
+        this.failedTrackers.clear();
+        this.activeTrackerIndex = this.selectRandomTracker();
+      }
       return;
     }
 
     const tracker = this.config.trackerAddresses[this.activeTrackerIndex];
     console.log(`[TrackerClient] Switched to tracker ${this.activeTrackerIndex + 1}: ${tracker.substring(0, 20)}...`);
 
-    // Announce to new tracker
+    // Announce to new tracker with small delay for I2P latency
     await this.announce();
+    await new Promise(resolve => setTimeout(resolve, 1500));
     await this.requestPeers();
+  }
+
+  /**
+   * Send a signed message to the tracker
+   */
+  private async sendSignedMessage(destination: string, message: TrackerMessage): Promise<boolean> {
+    if (!this.sendMessage) return false;
+
+    if (this.signingKeys) {
+      // Create signed message
+      const signedMsg = createSignedMessage(
+        message,
+        this.signingKeys.privateKey,
+        this.signingKeys.publicKey
+      );
+      return this.sendMessage(destination, signedMsg);
+    } else {
+      // Fallback to unsigned (legacy)
+      return this.sendMessage(destination, message);
+    }
   }
 
   async announce(): Promise<void> {
@@ -287,7 +374,7 @@ export class TrackerClient extends EventEmitter {
     };
 
     try {
-      await this.sendMessage(tracker, message);
+      await this.sendSignedMessage(tracker, message);
       console.log('[TrackerClient] Announced to tracker:', tracker.substring(0, 20) + '...');
     } catch (error: any) {
       console.error('[TrackerClient] Announce failed:', error.message);
@@ -306,7 +393,7 @@ export class TrackerClient extends EventEmitter {
     };
 
     try {
-      await this.sendMessage(tracker, message);
+      await this.sendSignedMessage(tracker, message);
       console.log('[TrackerClient] Requested peer list from tracker');
     } catch (error: any) {
       console.error('[TrackerClient] Request peers failed:', error.message);
@@ -335,14 +422,47 @@ export class TrackerClient extends EventEmitter {
       return false; // Not a tracker message
     }
 
-    console.log(`[TrackerClient] Received message from tracker: ${message.type}`);
+    // Handle signed messages (new format)
+    let actualMessage: TrackerMessage;
+    let signingKey: string | undefined;
+
+    if (message.signature && message.signingKey && message.nonce) {
+      // Verify the signed message
+      const verification = verifySignedMessage({
+        data: message.data,
+        nonce: message.nonce,
+        timestamp: message.timestamp,
+        signature: message.signature,
+        signingKey: message.signingKey
+      });
+
+      if (!verification.valid) {
+        console.log(`[TrackerClient] Rejected tracker message: ${verification.error}`);
+        return true; // Handled (rejected)
+      }
+
+      // Check for replay attack
+      if (this.usedNonces.has(message.nonce)) {
+        console.log('[TrackerClient] Rejected tracker message: Nonce reused');
+        return true;
+      }
+      this.usedNonces.add(message.nonce);
+
+      actualMessage = verification.data as TrackerMessage;
+      signingKey = message.signingKey;
+      console.log(`[TrackerClient] Received verified message from tracker: ${actualMessage.type}`);
+    } else {
+      // Legacy unsigned message
+      actualMessage = message as TrackerMessage;
+      console.log(`[TrackerClient] Received message from tracker: ${actualMessage.type} (unsigned)`);
+    }
 
     // Update last response time
     this.lastResponseTime.set(from, Date.now());
 
-    switch (message.type) {
+    switch (actualMessage.type) {
       case 'PEERS_LIST':
-        this.handlePeersList(message.payload);
+        this.handlePeersList(actualMessage.payload, signingKey);
         return true;
       case 'PONG':
         console.log('[TrackerClient] Received PONG from tracker');
@@ -352,9 +472,9 @@ export class TrackerClient extends EventEmitter {
     }
   }
 
-  private handlePeersList(payload: { peers: TrackerPeer[] }): void {
+  private handlePeersList(payload: { peers: TrackerPeer[] }, trackerSigningKey?: string): void {
     const peers = payload.peers || [];
-    console.log(`[TrackerClient] Received ${peers.length} peers from tracker`);
+    console.log(`[TrackerClient] Received ${peers.length} peers from tracker${trackerSigningKey ? ' (verified)' : ''}`);
 
     // Track which peers are in the current list
     const currentPeerKeys = new Set<string>();
@@ -414,7 +534,7 @@ export class TrackerClient extends EventEmitter {
           timestamp: Date.now()
         };
         try {
-          await this.sendMessage(trackerAddr, message);
+          await this.sendSignedMessage(trackerAddr, message);
         } catch (e) {
           // Ignore errors when disconnecting
         }
@@ -425,6 +545,7 @@ export class TrackerClient extends EventEmitter {
     this.isConnected = false;
     this.activeTrackerIndex = -1;
     this.knownPeers.clear();
+    this.usedNonces.clear();
     console.log('[TrackerClient] Disconnected from tracker');
   }
 

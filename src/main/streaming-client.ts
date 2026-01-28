@@ -6,16 +6,17 @@ import { createStream, I2pSamStream } from '@diva.exchange/i2p-sam';
 import { app } from 'electron';
 import { DownloadOps } from './database';
 import type { Download } from '../shared/types';
-
-// Protocol message types (must match streaming-server.ts)
-const MSG_FILE_REQUEST = 0x01;
-const MSG_FILE_HEADER = 0x02;
-const MSG_FILE_CHUNK = 0x03;
-const MSG_FILE_COMPLETE = 0x04;
-const MSG_FILE_ERROR = 0x05;
+import {
+  CONSTANTS,
+  MSG_FILE_REQUEST,
+  MSG_FILE_HEADER,
+  MSG_FILE_CHUNK,
+  MSG_FILE_COMPLETE,
+  MSG_FILE_ERROR
+} from '../shared/types';
 
 // Chunk size for progress tracking
-const PROGRESS_CHUNK_SIZE = 256 * 1024; // 256KB for progress updates
+const PROGRESS_CHUNK_SIZE = CONSTANTS.PROGRESS_CHUNK_SIZE;
 
 interface StreamDownload {
   id: number;
@@ -32,6 +33,8 @@ interface StreamDownload {
   speed: number;
   startTime: number;
   lastError?: string;
+  retryCount: number;
+  retryTimeout?: NodeJS.Timeout;
 }
 
 interface StreamingClientConfig {
@@ -40,6 +43,11 @@ interface StreamingClientConfig {
   downloadPath: string;
   maxParallelDownloads: number;
   connectionTimeout: number;
+  maxRetries: number;
+  retryBaseDelayMs: number;
+  retryMaxDelayMs: number;
+  minFreeSpaceBytes: number;
+  autoResumeOnStart: boolean;
 }
 
 export class StreamingClient extends EventEmitter {
@@ -47,6 +55,7 @@ export class StreamingClient extends EventEmitter {
   private activeDownloads: Map<number, StreamDownload> = new Map();
   private downloadQueue: number[] = [];
   private isInitialized: boolean = false;
+  private peerDestinationMap: Map<string, string> = new Map(); // b32 -> full destination
 
   constructor(config: Partial<StreamingClientConfig> = {}) {
     super();
@@ -56,8 +65,13 @@ export class StreamingClient extends EventEmitter {
       samHost: config.samHost || '127.0.0.1',
       samPortTCP: config.samPortTCP || 7656,
       downloadPath: config.downloadPath || downloadPath,
-      maxParallelDownloads: config.maxParallelDownloads || 3,
-      connectionTimeout: config.connectionTimeout || 120000 // 2 minutes for I2P
+      maxParallelDownloads: config.maxParallelDownloads || CONSTANTS.MAX_PARALLEL_DOWNLOADS,
+      connectionTimeout: config.connectionTimeout || CONSTANTS.CONNECTION_TIMEOUT,
+      maxRetries: config.maxRetries || CONSTANTS.MAX_RETRIES,
+      retryBaseDelayMs: config.retryBaseDelayMs || CONSTANTS.RETRY_BASE_DELAY,
+      retryMaxDelayMs: config.retryMaxDelayMs || CONSTANTS.RETRY_MAX_DELAY,
+      minFreeSpaceBytes: config.minFreeSpaceBytes || CONSTANTS.MIN_FREE_SPACE_BYTES,
+      autoResumeOnStart: config.autoResumeOnStart ?? true
     };
 
     // Ensure download directory exists
@@ -68,11 +82,94 @@ export class StreamingClient extends EventEmitter {
     this.isInitialized = true;
   }
 
+  /**
+   * Update peer destination mapping (for handling reconnections)
+   */
+  updatePeerDestination(b32Address: string, newDestination: string): void {
+    this.peerDestinationMap.set(b32Address, newDestination);
+
+    // Update any active downloads that use this peer
+    for (const download of this.activeDownloads.values()) {
+      const downloadB32 = this.getB32FromDestination(download.peerId);
+      if (downloadB32 === b32Address && download.peerId !== newDestination) {
+        console.log(`[StreamingClient] Updating peer destination for download ${download.id}`);
+        download.peerId = newDestination;
+        // Update in database too
+        DownloadOps.updatePeerId(download.id, newDestination);
+      }
+    }
+  }
+
+  private getB32FromDestination(dest: string): string {
+    // First 52 chars of base64 destination form a unique-ish identifier
+    return dest.substring(0, 52);
+  }
+
   setDownloadPath(downloadPath: string): void {
     this.config.downloadPath = downloadPath;
     if (!fs.existsSync(this.config.downloadPath)) {
       fs.mkdirSync(this.config.downloadPath, { recursive: true });
     }
+  }
+
+  /**
+   * Check available disk space (Windows compatible)
+   */
+  private async checkDiskSpace(requiredBytes: number): Promise<{ enough: boolean; available: number }> {
+    return new Promise((resolve) => {
+      try {
+        if (process.platform === 'win32') {
+          const { exec } = require('child_process');
+          const drive = path.parse(this.config.downloadPath).root || 'C:\\';
+          const driveLetter = drive.charAt(0).toUpperCase();
+
+          exec(`wmic logicaldisk where "DeviceID='${driveLetter}:'" get FreeSpace /format:value`,
+            (error: any, stdout: string) => {
+              if (error) {
+                // If we can't check, assume we have space
+                resolve({ enough: true, available: Infinity });
+                return;
+              }
+              const match = stdout.match(/FreeSpace=(\d+)/);
+              const available = match ? parseInt(match[1], 10) : Infinity;
+              const totalRequired = requiredBytes + this.config.minFreeSpaceBytes;
+              resolve({ enough: available >= totalRequired, available });
+            }
+          );
+        } else {
+          // Unix/Mac - use statfs
+          fs.statfs(this.config.downloadPath, (err, stats) => {
+            if (err) {
+              resolve({ enough: true, available: Infinity });
+              return;
+            }
+            const available = stats.bavail * stats.bsize;
+            const totalRequired = requiredBytes + this.config.minFreeSpaceBytes;
+            resolve({ enough: available >= totalRequired, available });
+          });
+        }
+      } catch {
+        resolve({ enough: true, available: Infinity });
+      }
+    });
+  }
+
+  /**
+   * Sanitize filename to prevent path traversal
+   */
+  private sanitizeFilename(filename: string): string {
+    if (!filename) return 'unnamed';
+    let safe = path.basename(filename);
+    safe = safe.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+    if (safe.startsWith('.')) {
+      safe = '_' + safe.substring(1);
+    }
+    if (safe.length > 255) {
+      const ext = path.extname(safe);
+      const name = path.basename(safe, ext);
+      safe = name.substring(0, 255 - ext.length) + ext;
+    }
+    return safe || 'unnamed';
   }
 
   async addDownload(
@@ -82,9 +179,19 @@ export class StreamingClient extends EventEmitter {
     peerName: string,
     totalSize: number
   ): Promise<number> {
-    const savePath = path.join(this.config.downloadPath, filename);
+    // Sanitize filename
+    const safeFilename = this.sanitizeFilename(filename);
+    const savePath = path.join(this.config.downloadPath, safeFilename);
 
-    // Check if download already exists
+    // Check disk space
+    const diskCheck = await this.checkDiskSpace(totalSize);
+    if (!diskCheck.enough) {
+      const availableMB = Math.round(diskCheck.available / (1024 * 1024));
+      const requiredMB = Math.round((totalSize + this.config.minFreeSpaceBytes) / (1024 * 1024));
+      throw new Error(`Not enough disk space. Available: ${availableMB}MB, Required: ${requiredMB}MB`);
+    }
+
+    // Check if download already exists in memory
     const existing = Array.from(this.activeDownloads.values())
       .find(d => d.fileHash === fileHash);
     if (existing) {
@@ -102,11 +209,13 @@ export class StreamingClient extends EventEmitter {
       // Resume existing download
       id = dbDownload.id;
       downloadedSize = dbDownload.downloadedSize || 0;
+      // Update peerId in case it changed (peer reconnected)
+      DownloadOps.updatePeerId(id, peerId);
       console.log(`[StreamingClient] Resuming download ${id}, already downloaded: ${downloadedSize}`);
     } else {
       // Create new database entry
       id = DownloadOps.create({
-        filename,
+        filename: safeFilename,
         fileHash,
         peerId,
         peerName,
@@ -117,7 +226,7 @@ export class StreamingClient extends EventEmitter {
 
     const download: StreamDownload = {
       id,
-      filename,
+      filename: safeFilename,
       fileHash,
       peerId,
       peerName,
@@ -128,7 +237,8 @@ export class StreamingClient extends EventEmitter {
       stream: null,
       writeStream: null,
       speed: 0,
-      startTime: 0
+      startTime: 0,
+      retryCount: 0
     };
 
     this.activeDownloads.set(id, download);
@@ -136,7 +246,7 @@ export class StreamingClient extends EventEmitter {
 
     this.emit('download:added', {
       id,
-      filename,
+      filename: safeFilename,
       totalSize,
       peerName
     });
@@ -163,6 +273,19 @@ export class StreamingClient extends EventEmitter {
     }
   }
 
+  /**
+   * Calculate exponential backoff delay with jitter
+   */
+  private calculateBackoff(attempt: number): number {
+    const delay = Math.min(
+      this.config.retryBaseDelayMs * Math.pow(2, attempt),
+      this.config.retryMaxDelayMs
+    );
+    // Add jitter (±20%)
+    const jitter = delay * 0.2 * (Math.random() - 0.5);
+    return Math.round(delay + jitter);
+  }
+
   private async startDownload(id: number): Promise<void> {
     const download = this.activeDownloads.get(id);
     if (!download) return;
@@ -171,7 +294,7 @@ export class StreamingClient extends EventEmitter {
     download.startTime = Date.now();
     DownloadOps.setStatus(id, 'downloading');
 
-    console.log(`[StreamingClient] Starting download ${id}: ${download.filename}`);
+    console.log(`[StreamingClient] Starting download ${id}: ${download.filename} (attempt ${download.retryCount + 1})`);
     console.log(`[StreamingClient] Connecting to peer: ${download.peerId.substring(0, 30)}...`);
 
     this.emit('download:started', { id, filename: download.filename });
@@ -190,6 +313,7 @@ export class StreamingClient extends EventEmitter {
       });
 
       download.stream = samStream;
+      download.retryCount = 0; // Reset retry count on successful connection
       console.log(`[StreamingClient] Connected to peer for download ${id}`);
 
       // Set up data handler
@@ -248,8 +372,7 @@ export class StreamingClient extends EventEmitter {
     headerReceived: boolean,
     onHeaderReceived: () => void
   ): Buffer {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let buffer: any = inputBuffer;
+    let buffer: Buffer = inputBuffer;
     while (buffer.length > 0) {
       const msgType = buffer[0];
 
@@ -354,6 +477,11 @@ export class StreamingClient extends EventEmitter {
       download.stream.close();
     }
 
+    // Clear any retry timeout
+    if (download.retryTimeout) {
+      clearTimeout(download.retryTimeout);
+    }
+
     // Verify file hash
     const partPath = download.savePath + '.part';
     const isValid = await this.verifyFile(partPath, download.fileHash);
@@ -404,21 +532,44 @@ export class StreamingClient extends EventEmitter {
       } catch (e) {}
     }
 
-    download.status = 'failed';
-    download.lastError = errorMessage;
     download.stream = null;
     download.writeStream = null;
+    download.lastError = errorMessage;
 
-    // Don't delete from activeDownloads yet - allow resume
-    DownloadOps.setStatus(id, 'paused'); // Use 'paused' so it can be resumed
+    // Check if we should retry
+    if (download.retryCount < this.config.maxRetries) {
+      download.retryCount++;
+      const delay = this.calculateBackoff(download.retryCount);
 
-    this.emit('download:failed', {
-      id,
-      filename: download.filename,
-      error: errorMessage
-    });
+      console.log(`[StreamingClient] Scheduling retry ${download.retryCount}/${this.config.maxRetries} for download ${id} in ${delay}ms`);
 
-    this.processQueue();
+      download.status = 'pending';
+      download.retryTimeout = setTimeout(() => {
+        if (download.status === 'pending') {
+          this.startDownload(id);
+        }
+      }, delay);
+
+      this.emit('download:retrying', {
+        id,
+        filename: download.filename,
+        attempt: download.retryCount,
+        maxRetries: this.config.maxRetries,
+        nextRetryMs: delay
+      });
+    } else {
+      // Max retries reached, mark as failed
+      download.status = 'failed';
+      DownloadOps.setStatus(id, 'paused'); // Use 'paused' so it can be manually resumed
+
+      this.emit('download:failed', {
+        id,
+        filename: download.filename,
+        error: errorMessage
+      });
+
+      this.processQueue();
+    }
   }
 
   private async verifyFile(filePath: string, expectedHash: string): Promise<boolean> {
@@ -437,9 +588,14 @@ export class StreamingClient extends EventEmitter {
 
   pauseDownload(id: number): boolean {
     const download = this.activeDownloads.get(id);
-    if (download && (download.status === 'downloading' || download.status === 'connecting')) {
+    if (download && (download.status === 'downloading' || download.status === 'connecting' || download.status === 'pending')) {
       // Save current progress
       DownloadOps.updateProgress(id, download.downloadedSize);
+
+      // Clear retry timeout if any
+      if (download.retryTimeout) {
+        clearTimeout(download.retryTimeout);
+      }
 
       // Close streams
       if (download.stream) {
@@ -467,6 +623,7 @@ export class StreamingClient extends EventEmitter {
     const download = this.activeDownloads.get(id);
     if (download && (download.status === 'paused' || download.status === 'failed')) {
       download.status = 'pending';
+      download.retryCount = 0; // Reset retry count for manual resume
       this.downloadQueue.push(id);
       this.processQueue();
 
@@ -480,6 +637,11 @@ export class StreamingClient extends EventEmitter {
   cancelDownload(id: number): boolean {
     const download = this.activeDownloads.get(id);
     if (download) {
+      // Clear retry timeout
+      if (download.retryTimeout) {
+        clearTimeout(download.retryTimeout);
+      }
+
       // Close streams
       if (download.stream) {
         try {
@@ -524,7 +686,9 @@ export class StreamingClient extends EventEmitter {
         startedAt: d.startedAt,
         completedAt: d.completedAt,
         progress: ((active?.downloadedSize || d.downloadedSize) / d.totalSize) * 100,
-        speed: active?.speed || 0
+        speed: active?.speed || 0,
+        error: active?.lastError,
+        retryCount: active?.retryCount
       };
     });
   }
@@ -534,8 +698,11 @@ export class StreamingClient extends EventEmitter {
       .filter(d => d.status === 'downloading' || d.status === 'connecting');
   }
 
-  // Load pending/paused downloads from database on startup
-  loadFromDatabase(): void {
+  /**
+   * Load pending/paused downloads from database on startup
+   * @param autoResume If true, automatically start pending downloads
+   */
+  loadFromDatabase(autoResume: boolean = false): void {
     const pending = DownloadOps.getActive() as any[];
     for (const d of pending) {
       if (this.activeDownloads.has(d.id)) continue;
@@ -548,19 +715,60 @@ export class StreamingClient extends EventEmitter {
         peerName: d.peerName,
         totalSize: d.totalSize,
         downloadedSize: d.downloadedSize || 0,
-        status: 'pending',
+        status: autoResume ? 'pending' : 'paused',
         savePath: d.savePath,
         stream: null,
         writeStream: null,
         speed: 0,
-        startTime: 0
+        startTime: 0,
+        retryCount: 0
       };
 
       this.activeDownloads.set(d.id, download);
-      this.downloadQueue.push(d.id);
+
+      if (autoResume) {
+        this.downloadQueue.push(d.id);
+      }
     }
 
-    console.log(`[StreamingClient] Loaded ${pending.length} pending downloads`);
+    console.log(`[StreamingClient] Loaded ${pending.length} pending downloads (autoResume: ${autoResume})`);
+
+    if (autoResume && pending.length > 0) {
+      // Start processing queue after a short delay to let I2P stabilize
+      setTimeout(() => {
+        this.processQueue();
+      }, 2000);
+    }
+  }
+
+  /**
+   * Cleanup all resources (call on app shutdown)
+   */
+  cleanup(): void {
+    console.log('[StreamingClient] Cleaning up...');
+
+    // Clear all retry timeouts
+    for (const download of this.activeDownloads.values()) {
+      if (download.retryTimeout) {
+        clearTimeout(download.retryTimeout);
+      }
+      if (download.stream) {
+        try {
+          download.stream.close();
+        } catch (e) {}
+      }
+      if (download.writeStream) {
+        try {
+          download.writeStream.close();
+        } catch (e) {}
+      }
+      // Save progress
+      DownloadOps.updateProgress(download.id, download.downloadedSize);
+    }
+
+    this.activeDownloads.clear();
+    this.downloadQueue = [];
+    this.removeAllListeners();
   }
 }
 

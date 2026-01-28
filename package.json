@@ -21,7 +21,6 @@
   "dependencies": {
     "@diva.exchange/i2p-sam": "^5.5.2",
     "better-sqlite3": "^12.6.2",
-    "crypto-js": "^4.2.0",
     "electron-store": "^8.1.0",
     "mime-types": "^2.1.35",
     "uuid": "^9.0.1"
@@ -29,7 +28,6 @@
   "devDependencies": {
     "@electron/rebuild": "^4.0.3",
     "@types/better-sqlite3": "^7.6.8",
-    "@types/crypto-js": "^4.2.2",
     "@types/mime-types": "^2.1.4",
     "@types/node": "^20.11.0",
     "@types/react": "^18.2.48",

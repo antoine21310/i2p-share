@@ -1,36 +1,26 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useStore } from '../store';
+import { formatBytes, formatSpeed, formatETA } from '../utils/format';
 
 export function DownloadsPage() {
   const { downloads, fetchDownloads, pauseDownload, resumeDownload, cancelDownload } = useStore();
 
   useEffect(() => {
     fetchDownloads();
-    // Poll more frequently (every 1 second) for better responsiveness
-    const interval = setInterval(fetchDownloads, 1000);
+    // Event-driven updates are now handled by the store
+    // Only poll as fallback every 3 seconds for active downloads
+    const interval = setInterval(() => {
+      const hasActive = downloads.some(d =>
+        ['pending', 'connecting', 'downloading'].includes(d.status)
+      );
+      if (hasActive) {
+        fetchDownloads();
+      }
+    }, 3000);
 
-    // Listen for download events to trigger immediate refresh
-    const unsubAdded = window.electron.on('download:added', fetchDownloads);
-    const unsubStarted = window.electron.on('download:started', fetchDownloads);
-    const unsubProgress = window.electron.on('download:progress', fetchDownloads);
-    const unsubPaused = window.electron.on('download:paused', fetchDownloads);
-    const unsubResumed = window.electron.on('download:resumed', fetchDownloads);
-    const unsubCompleted = window.electron.on('download:completed', fetchDownloads);
-    const unsubFailed = window.electron.on('download:failed', fetchDownloads);
+    return () => clearInterval(interval);
+  }, [downloads.length]);
 
-    return () => {
-      clearInterval(interval);
-      unsubAdded();
-      unsubStarted();
-      unsubProgress();
-      unsubPaused();
-      unsubResumed();
-      unsubCompleted();
-      unsubFailed();
-    };
-  }, []);
-
-  // Include 'connecting' and 'pending' in active downloads
   const activeDownloads = downloads.filter(d => ['pending', 'connecting', 'downloading'].includes(d.status));
   const pausedDownloads = downloads.filter(d => d.status === 'paused');
   const completedDownloads = downloads.filter(d => d.status === 'completed');
@@ -165,6 +155,7 @@ interface DownloadItemProps {
     progress: number;
     speed: number;
     peerName: string;
+    error?: string;
   };
   onPause?: () => void;
   onResume?: () => void;
@@ -172,6 +163,8 @@ interface DownloadItemProps {
 }
 
 function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemProps) {
+  const [showConfirm, setShowConfirm] = useState(false);
+
   const isConnecting = download.status === 'connecting';
   const isPending = download.status === 'pending';
   const isActive = download.status === 'downloading';
@@ -180,16 +173,33 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
   const isFailed = download.status === 'failed';
 
   const handleOpenFile = () => {
-    // This would open the file location
     window.electron.showItemInFolder(download.filename);
   };
+
+  const handleCancel = () => {
+    if (isCompleted) {
+      onCancel();
+    } else {
+      setShowConfirm(true);
+    }
+  };
+
+  const confirmCancel = () => {
+    setShowConfirm(false);
+    onCancel();
+  };
+
+  const remainingBytes = download.totalSize - download.downloadedSize;
+  const eta = isActive && download.speed > 0
+    ? formatETA(remainingBytes, download.speed)
+    : null;
 
   return (
     <div className="card p-4">
       <div className="flex items-start gap-4">
         {/* Status icon */}
         <div className={`
-          w-10 h-10 rounded-lg flex items-center justify-center
+          w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0
           ${isCompleted ? 'bg-green-500/20 text-green-400' : ''}
           ${isActive ? 'bg-primary-500/20 text-primary-400' : ''}
           ${isConnecting ? 'bg-blue-500/20 text-blue-400' : ''}
@@ -235,16 +245,22 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
           <h3 className="font-semibold text-white truncate" title={download.filename}>
             {download.filename}
           </h3>
-          <div className="flex items-center gap-4 mt-1 text-sm text-dark-400">
+          <div className="flex items-center gap-4 mt-1 text-sm text-dark-400 flex-wrap">
             <span>{formatBytes(download.downloadedSize)} / {formatBytes(download.totalSize)}</span>
             {isConnecting && (
               <span className="text-blue-400">Connecting to peer...</span>
             )}
             {isPending && (
-              <span className="text-dark-500">Waiting...</span>
+              <span className="text-dark-500">Waiting in queue...</span>
             )}
             {isActive && download.speed > 0 && (
-              <span className="text-primary-400">{formatSpeed(download.speed)}</span>
+              <>
+                <span className="text-primary-400">{formatSpeed(download.speed)}</span>
+                {eta && <span className="text-dark-500">ETA: {eta}</span>}
+              </>
+            )}
+            {isFailed && download.error && (
+              <span className="text-red-400">{download.error}</span>
             )}
             <span>from {download.peerName}</span>
           </div>
@@ -255,7 +271,7 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
               <div className="progress-bar">
                 <div
                   className={`progress-fill ${isFailed ? 'bg-red-500' : ''}`}
-                  style={{ width: `${download.progress}%` }}
+                  style={{ width: `${Math.min(download.progress, 100)}%` }}
                 />
               </div>
               <p className="text-xs text-dark-500 mt-1">{download.progress.toFixed(1)}%</p>
@@ -264,7 +280,7 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
         </div>
 
         {/* Actions */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           {isActive && onPause && (
             <button
               onClick={onPause}
@@ -300,7 +316,7 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
             </button>
           )}
           <button
-            onClick={onCancel}
+            onClick={handleCancel}
             className="btn btn-ghost p-2 text-red-400 hover:text-red-300"
             title="Remove"
           >
@@ -310,18 +326,29 @@ function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemPro
           </button>
         </div>
       </div>
+
+      {/* Confirmation modal */}
+      {showConfirm && (
+        <div className="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+          <p className="text-sm text-white mb-3">
+            Are you sure you want to cancel this download? Progress will be lost.
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={confirmCancel}
+              className="btn btn-sm bg-red-500 hover:bg-red-600 text-white"
+            >
+              Yes, cancel
+            </button>
+            <button
+              onClick={() => setShowConfirm(false)}
+              className="btn btn-sm btn-ghost"
+            >
+              Keep downloading
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-function formatSpeed(bytesPerSec: number): string {
-  return formatBytes(bytesPerSec) + '/s';
 }

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { TitleBar } from './components/TitleBar';
+import { NotificationContainer } from './components/Notifications';
 import { SearchPage } from './pages/Search';
 import { DownloadsPage } from './pages/Downloads';
 import { MySharesPage } from './pages/MyShares';
@@ -12,20 +13,27 @@ type Page = 'search' | 'downloads' | 'shares' | 'peers' | 'settings';
 
 export function App() {
   const [currentPage, setCurrentPage] = useState<Page>('search');
-  const { fetchNetworkStatus, fetchDownloads } = useStore();
+  const {
+    fetchNetworkStatus,
+    fetchDownloads,
+    fetchPeers,
+    fetchSharedFolders,
+    fetchSharedFiles,
+    setupEventListeners
+  } = useStore();
 
   useEffect(() => {
     // Initial data fetch
     fetchNetworkStatus();
     fetchDownloads();
+    fetchPeers();
+    fetchSharedFolders();
+    fetchSharedFiles();
 
-    // Set up polling for updates
-    const interval = setInterval(() => {
-      fetchNetworkStatus();
-      fetchDownloads();
-    }, 5000);
+    // Set up event listeners (returns cleanup function)
+    const cleanup = setupEventListeners();
 
-    return () => clearInterval(interval);
+    return cleanup;
   }, []);
 
   const renderPage = () => {
@@ -54,6 +62,7 @@ export function App() {
           {renderPage()}
         </main>
       </div>
+      <NotificationContainer />
     </div>
   );
 }

@@ -4,17 +4,12 @@ import Store from 'electron-store';
 import { initDatabase, closeDatabase, FileOps, SharedFolderOps, PeerOps, RemoteFileOps } from './database';
 import { fileIndexer } from './file-indexer';
 import { dhtSearch } from './dht-search';
-import { fileServer } from './file-server';
-import { downloadClient } from './download-client';
 import { streamingClient } from './streaming-client';
 import { streamingServer } from './streaming-server';
 import { i2pConnection } from './i2p-connection';
 import { i2pdManager } from './i2pd-manager';
 import { trackerClient } from './tracker-client';
 import type { SearchFilters, NetworkStats, SearchResult } from '../shared/types';
-
-// Use streaming by default (more reliable), fallback to UDP for compatibility
-const USE_STREAMING = true;
 
 // Configuration store
 const store = new Store({
@@ -133,66 +128,39 @@ function setupIPC(): void {
     }
 
     const displayName = peerName || 'Unknown Peer';
-
-    if (USE_STREAMING) {
-      // Use I2P Streaming for reliable transfers with resume support
-      // Prefer streaming destination if available, fall back to regular peerId
-      const targetDest = streamingDest || peerId;
-      return streamingClient.addDownload(filename, fileHash, targetDest, displayName, size);
-    } else {
-      // Legacy UDP-based transfers
-      return downloadClient.addDownload(filename, fileHash, peerId, displayName, size);
-    }
+    // Prefer streaming destination if available, fall back to regular peerId
+    const targetDest = streamingDest || peerId;
+    return streamingClient.addDownload(filename, fileHash, targetDest, displayName, size);
   });
 
   ipcMain.handle('download:pause', async (_event, downloadId: number) => {
-    if (USE_STREAMING) {
-      streamingClient.pauseDownload(downloadId);
-    } else {
-      downloadClient.pauseDownload(downloadId);
-    }
+    streamingClient.pauseDownload(downloadId);
   });
 
   ipcMain.handle('download:resume', async (_event, downloadId: number) => {
-    if (USE_STREAMING) {
-      streamingClient.resumeDownload(downloadId);
-    } else {
-      downloadClient.resumeDownload(downloadId);
-    }
+    streamingClient.resumeDownload(downloadId);
   });
 
   ipcMain.handle('download:cancel', async (_event, downloadId: number) => {
-    if (USE_STREAMING) {
-      streamingClient.cancelDownload(downloadId);
-    } else {
-      downloadClient.cancelDownload(downloadId);
-    }
+    streamingClient.cancelDownload(downloadId);
   });
 
   ipcMain.handle('download:list', async () => {
-    if (USE_STREAMING) {
-      return streamingClient.getDownloads();
-    } else {
-      return downloadClient.getDownloads();
-    }
+    return streamingClient.getDownloads();
   });
 
   // Active uploads (files being downloaded by other peers)
   ipcMain.handle('uploads:active', async () => {
-    if (USE_STREAMING) {
-      const sessions = streamingServer.getActiveSessions();
-      return sessions.map(s => ({
-        sessionId: s.clientId,
-        filename: s.filename,
-        totalSize: s.totalSize,
-        bytesSent: s.bytesSent,
-        speed: s.speed,
-        progress: s.totalSize > 0 ? (s.bytesSent / s.totalSize) * 100 : 0,
-        isPaused: s.isPaused
-      }));
-    } else {
-      return [];
-    }
+    const sessions = streamingServer.getActiveSessions();
+    return sessions.map(s => ({
+      sessionId: s.clientId,
+      filename: s.filename,
+      totalSize: s.totalSize,
+      bytesSent: s.bytesSent,
+      speed: s.speed,
+      progress: s.totalSize > 0 ? (s.bytesSent / s.totalSize) * 100 : 0,
+      isPaused: s.isPaused
+    }));
   });
 
   // Shares
@@ -233,8 +201,8 @@ function setupIPC(): void {
   // Network
   ipcMain.handle('network:status', async (): Promise<NetworkStats & { statusText: string }> => {
     const dhtStats = dhtSearch.getStats();
-    const uploadStats = USE_STREAMING ? streamingServer.getStats() : fileServer.getStats();
-    const activeDownloads = USE_STREAMING ? streamingClient.getActiveDownloads() : downloadClient.getActiveDownloads();
+    const uploadStats = streamingServer.getStats();
+    const activeDownloads = streamingClient.getActiveDownloads();
     const i2pState = i2pConnection.getState();
 
     let statusText = '';
@@ -307,25 +275,18 @@ function setupIPC(): void {
           await i2pConnection.sendMessage(dest, message);
         });
 
-        // Start file server and download client
-        if (USE_STREAMING) {
-          // Start streaming server for reliable file transfers
-          console.log('[Main] Starting streaming server...');
-          try {
-            const streamingDest = await streamingServer.start();
-            console.log('[Main] Streaming server started');
-            // Set streaming destination for tracker announcements
-            trackerClient.setStreamingDestination(streamingDest);
-          } catch (err: any) {
-            console.error('[Main] Failed to start streaming server:', err.message);
-          }
-          // Load pending downloads
-          streamingClient.loadFromDatabase();
-        } else {
-          // Legacy UDP-based transfers
-          fileServer.setConnection(i2pConnection);
-          downloadClient.setConnection(i2pConnection);
+        // Start streaming server for reliable file transfers
+        console.log('[Main] Starting streaming server...');
+        try {
+          const streamingDest = await streamingServer.start();
+          console.log('[Main] Streaming server started');
+          // Set streaming destination for tracker announcements
+          trackerClient.setStreamingDestination(streamingDest);
+        } catch (err: any) {
+          console.error('[Main] Failed to start streaming server:', err.message);
         }
+        // Load pending downloads with auto-resume
+        streamingClient.loadFromDatabase(true);
 
         // Connect to tracker for peer discovery
         await connectToTracker(result.destination);
@@ -624,62 +585,47 @@ function setupEventForwarding(): void {
     }
   });
 
-  // Forward download events (both streaming and legacy)
-  if (USE_STREAMING) {
-    // Notify UI immediately when download is added
-    streamingClient.on('download:added', (data) => {
-      mainWindow?.webContents.send('download:added', data);
-    });
+  // Forward download events
+  streamingClient.on('download:added', (data) => {
+    mainWindow?.webContents.send('download:added', data);
+  });
 
-    streamingClient.on('download:started', (data) => {
-      mainWindow?.webContents.send('download:started', data);
-    });
+  streamingClient.on('download:started', (data) => {
+    mainWindow?.webContents.send('download:started', data);
+  });
 
-    streamingClient.on('download:progress', (data) => {
-      mainWindow?.webContents.send('download:progress', data);
-    });
+  streamingClient.on('download:progress', (data) => {
+    mainWindow?.webContents.send('download:progress', data);
+  });
 
-    streamingClient.on('download:completed', (data) => {
-      mainWindow?.webContents.send('download:completed', data);
-    });
+  streamingClient.on('download:completed', (data) => {
+    mainWindow?.webContents.send('download:completed', data);
+  });
 
-    streamingClient.on('download:failed', (data) => {
-      mainWindow?.webContents.send('download:failed', data);
-    });
+  streamingClient.on('download:failed', (data) => {
+    mainWindow?.webContents.send('download:failed', data);
+  });
 
-    streamingClient.on('download:paused', (data) => {
-      mainWindow?.webContents.send('download:paused', data);
-    });
+  streamingClient.on('download:paused', (data) => {
+    mainWindow?.webContents.send('download:paused', data);
+  });
 
-    streamingClient.on('download:resumed', (data) => {
-      mainWindow?.webContents.send('download:resumed', data);
-    });
+  streamingClient.on('download:resumed', (data) => {
+    mainWindow?.webContents.send('download:resumed', data);
+  });
 
-    // Forward upload events from streaming server
-    streamingServer.on('upload:start', (data) => {
-      mainWindow?.webContents.send('upload:start', data);
-    });
+  // Forward upload events from streaming server
+  streamingServer.on('upload:start', (data) => {
+    mainWindow?.webContents.send('upload:start', data);
+  });
 
-    streamingServer.on('upload:progress', (data) => {
-      mainWindow?.webContents.send('upload:progress', data);
-    });
+  streamingServer.on('upload:progress', (data) => {
+    mainWindow?.webContents.send('upload:progress', data);
+  });
 
-    streamingServer.on('upload:complete', (data) => {
-      mainWindow?.webContents.send('upload:complete', data);
-    });
-  } else {
-    downloadClient.on('download:progress', (data) => {
-      mainWindow?.webContents.send('download:progress', data);
-    });
-
-    downloadClient.on('download:completed', (data) => {
-      mainWindow?.webContents.send('download:completed', data);
-    });
-
-    downloadClient.on('download:failed', (data) => {
-      mainWindow?.webContents.send('download:failed', data);
-    });
-  }
+  streamingServer.on('upload:complete', (data) => {
+    mainWindow?.webContents.send('upload:complete', data);
+  });
 
   // Forward DHT events
   dhtSearch.on('search:result', (data) => {
@@ -843,25 +789,18 @@ async function startI2PAndConnect(): Promise<void> {
         await i2pConnection.sendMessage(dest, message);
       });
 
-      // Start file server and download client
-      if (USE_STREAMING) {
-        // Start streaming server for reliable file transfers
-        console.log('[Main] Starting streaming server...');
-        try {
-          const streamingDest = await streamingServer.start();
-          console.log('[Main] Streaming server started');
-          // Set streaming destination for tracker announcements
-          trackerClient.setStreamingDestination(streamingDest);
-        } catch (err: any) {
-          console.error('[Main] Failed to start streaming server:', err.message);
-        }
-        // Load pending downloads
-        streamingClient.loadFromDatabase();
-      } else {
-        // Legacy UDP-based transfers
-        fileServer.setConnection(i2pConnection);
-        downloadClient.setConnection(i2pConnection);
+      // Start streaming server for reliable file transfers
+      console.log('[Main] Starting streaming server...');
+      try {
+        const streamingDest = await streamingServer.start();
+        console.log('[Main] Streaming server started');
+        // Set streaming destination for tracker announcements
+        trackerClient.setStreamingDestination(streamingDest);
+      } catch (err: any) {
+        console.error('[Main] Failed to start streaming server:', err.message);
       }
+      // Load pending downloads with auto-resume
+      streamingClient.loadFromDatabase(true);
 
       // Connect to tracker for peer discovery
       await connectToTracker(result.destination);
@@ -898,9 +837,6 @@ app.whenReady().then(async () => {
 
   // Load saved data
   dhtSearch.loadFromDatabase();
-  if (!USE_STREAMING) {
-    downloadClient.loadFromDatabase();
-  }
   // Note: streamingClient.loadFromDatabase() is called when I2P connects
 
   // Setup IPC handlers
@@ -932,9 +868,7 @@ app.on('before-quit', async () => {
   console.log('[Main] Shutting down...');
 
   // Stop streaming server
-  if (USE_STREAMING) {
-    await streamingServer.stop();
-  }
+  await streamingServer.stop();
 
   // Notify tracker that we're disconnecting (so other peers are updated)
   await trackerClient.disconnect();

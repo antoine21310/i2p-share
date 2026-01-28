@@ -265,6 +265,11 @@ export const DownloadOps = {
   delete: (id: number) => {
     const db = getDatabase();
     return db.prepare('DELETE FROM downloads WHERE id = ?').run(id);
+  },
+
+  updatePeerId: (id: number, newPeerId: string) => {
+    const db = getDatabase();
+    return db.prepare('UPDATE downloads SET peerId = ? WHERE id = ?').run(newPeerId, id);
   }
 };
 

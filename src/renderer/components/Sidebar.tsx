@@ -1,5 +1,6 @@
 import React from 'react';
 import { useStore } from '../store';
+import { formatSpeed } from '../utils/format';
 
 type Page = 'search' | 'downloads' | 'shares' | 'peers' | 'settings';
 
@@ -16,9 +17,11 @@ interface NavItem {
 }
 
 export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
-  const { downloads, networkStatus } = useStore();
+  const { downloads, networkStatus, indexingProgress, connectionError } = useStore();
 
-  const activeDownloads = downloads.filter(d => d.status === 'downloading').length;
+  const activeDownloads = downloads.filter(d =>
+    ['pending', 'connecting', 'downloading'].includes(d.status)
+  ).length;
 
   const navItems: NavItem[] = [
     {
@@ -71,6 +74,28 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
     }
   ];
 
+  // Determine connection state
+  const getConnectionState = () => {
+    if (connectionError) {
+      return { status: 'error', color: 'bg-red-500', text: 'Error' };
+    }
+    if (networkStatus.statusText?.includes('Downloading')) {
+      return { status: 'downloading', color: 'bg-yellow-500 animate-pulse', text: 'Downloading I2P...' };
+    }
+    if (networkStatus.statusText?.includes('Starting')) {
+      return { status: 'starting', color: 'bg-yellow-500 animate-pulse', text: 'Starting...' };
+    }
+    if (networkStatus.statusText?.includes('Connecting')) {
+      return { status: 'connecting', color: 'bg-blue-500 animate-pulse', text: 'Connecting...' };
+    }
+    if (networkStatus.isConnected) {
+      return { status: 'connected', color: 'bg-green-500', text: 'Connected' };
+    }
+    return { status: 'disconnected', color: 'bg-dark-500', text: 'Disconnected' };
+  };
+
+  const connState = getConnectionState();
+
   return (
     <aside className="w-64 bg-dark-900 border-r border-dark-800 flex flex-col">
       {/* Navigation */}
@@ -98,27 +123,108 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
         ))}
       </nav>
 
+      {/* Indexing progress (if active) */}
+      {indexingProgress && (
+        <div className="px-4 pb-2">
+          <div className="card p-3 bg-blue-500/10 border-blue-500/30">
+            <div className="flex items-center gap-2 mb-2">
+              <svg className="w-4 h-4 text-blue-400 animate-spin" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              <span className="text-sm font-medium text-blue-400">Indexing files...</span>
+            </div>
+            <div className="text-xs text-dark-400 truncate mb-1">
+              {indexingProgress.currentFile || indexingProgress.folder}
+            </div>
+            <div className="h-1 bg-dark-700 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-all duration-300"
+                style={{
+                  width: indexingProgress.total > 0
+                    ? `${(indexingProgress.current / indexingProgress.total) * 100}%`
+                    : '0%'
+                }}
+              />
+            </div>
+            {indexingProgress.total > 0 && (
+              <p className="text-xs text-dark-500 mt-1">
+                {indexingProgress.current} / {indexingProgress.total} files
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Network status card */}
       <div className="p-4">
         <div className="card p-4">
+          {/* Connection status header */}
           <div className="flex items-center gap-3 mb-3">
-            <div className={`w-3 h-3 rounded-full ${networkStatus.isConnected ? 'status-online' : 'status-offline'}`} />
-            <span className="font-medium text-white">
-              {networkStatus.isConnected ? 'Connected' : 'Disconnected'}
+            <div className={`w-3 h-3 rounded-full ${connState.color}`} />
+            <span className="font-medium text-white flex-1">
+              {connState.text}
             </span>
+            {connState.status === 'connected' && (
+              <span className="text-xs text-dark-500">
+                {networkStatus.statusText?.match(/\(([^)]+)\)/)?.[1] || ''}
+              </span>
+            )}
           </div>
 
+          {/* Error message */}
+          {connectionError && (
+            <div className="mb-3 p-2 bg-red-500/10 border border-red-500/30 rounded text-xs text-red-400">
+              {connectionError}
+            </div>
+          )}
+
+          {/* Connected stats */}
           {networkStatus.isConnected && (
             <div className="space-y-2 text-sm">
               <div className="flex justify-between text-dark-400">
-                <span>Active Tunnels</span>
+                <span>Tunnels</span>
                 <span className="text-white">{networkStatus.activeTunnels}</span>
               </div>
               <div className="flex justify-between text-dark-400">
-                <span>Peers Online</span>
+                <span>Peers</span>
                 <span className="text-white">{networkStatus.peersConnected}</span>
               </div>
+              {(networkStatus.uploadSpeed > 0 || networkStatus.downloadSpeed > 0) && (
+                <>
+                  <div className="border-t border-dark-700 my-2" />
+                  {networkStatus.downloadSpeed > 0 && (
+                    <div className="flex justify-between text-dark-400">
+                      <span className="flex items-center gap-1">
+                        <svg className="w-3 h-3 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+                        </svg>
+                        Down
+                      </span>
+                      <span className="text-green-400">{formatSpeed(networkStatus.downloadSpeed)}</span>
+                    </div>
+                  )}
+                  {networkStatus.uploadSpeed > 0 && (
+                    <div className="flex justify-between text-dark-400">
+                      <span className="flex items-center gap-1">
+                        <svg className="w-3 h-3 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                        </svg>
+                        Up
+                      </span>
+                      <span className="text-blue-400">{formatSpeed(networkStatus.uploadSpeed)}</span>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
+          )}
+
+          {/* Disconnected state */}
+          {!networkStatus.isConnected && !connectionError && connState.status === 'disconnected' && (
+            <p className="text-xs text-dark-500">
+              Waiting to connect to I2P network...
+            </p>
           )}
         </div>
       </div>
