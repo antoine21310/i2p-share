@@ -19,8 +19,8 @@ interface ElectronAPI {
   // Search
   search: (query: string, filters: any) => Promise<any[]>;
 
-  // Downloads (legacy - delegates to torrent system)
-  startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) => Promise<number>;
+  // Downloads (delegates to torrent system)
+  startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string, infoHash?: string) => Promise<{ infoHash: string; name: string }>;
   pauseDownload: (downloadId: number) => Promise<void>;
   resumeDownload: (downloadId: number) => Promise<void>;
   cancelDownload: (downloadId: number) => Promise<void>;
@@ -61,7 +61,13 @@ interface ElectronAPI {
   // Tracker
   getTrackerAddresses: () => Promise<string[]>;
   setTrackerAddresses: (addresses: string[]) => Promise<{ success: boolean }>;
-  getActiveTracker: () => Promise<string | null>;
+  getActiveTracker: () => Promise<{
+    address: string | null;
+    isConnected: boolean;
+    peersCount: number;
+    configuredCount: number;
+    hasEmbeddedTracker: boolean;
+  } | null>;
   getTrackerPeers: () => Promise<any[]>;
   refreshTrackerPeers: () => Promise<{ success: boolean }>;
   // Legacy single address (backwards compat)
@@ -105,8 +111,8 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('search:query', query, filters),
 
   // Downloads
-  startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) =>
-    ipcRenderer.invoke('download:start', fileHash, peerId, filename, size, peerName, streamingDest),
+  startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string, infoHash?: string) =>
+    ipcRenderer.invoke('download:start', fileHash, peerId, filename, size, peerName, streamingDest, infoHash),
   pauseDownload: (downloadId: number) =>
     ipcRenderer.invoke('download:pause', downloadId),
   resumeDownload: (downloadId: number) =>

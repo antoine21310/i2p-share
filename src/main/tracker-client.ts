@@ -382,7 +382,15 @@ export class TrackerClient extends EventEmitter {
 
   async announce(): Promise<void> {
     const tracker = this.getActiveTracker();
-    if (!this.sendMessage || !tracker) return;
+    if (!this.sendMessage || !tracker) {
+      console.log(`[TrackerClient] Cannot announce: sendMessage=${!!this.sendMessage}, tracker=${!!tracker}`);
+      return;
+    }
+
+    console.log(`[TrackerClient] Announcing to tracker: ${toB32(tracker).substring(0, 20)}...`);
+    console.log(`[TrackerClient]   displayName: ${this.displayName}`);
+    console.log(`[TrackerClient]   filesCount: ${this.filesCount}`);
+    console.log(`[TrackerClient]   totalSize: ${this.totalSize}`);
 
     // Use the tracker address directly - it should be a full I2P destination
     // (Full destinations are base64 strings, typically ending in AAAA)
@@ -460,22 +468,37 @@ export class TrackerClient extends EventEmitter {
     // Compare both full destinations and b32 addresses
     const fromB32 = toB32(from);
 
+    console.log(`[TrackerClient] Checking message from: ${fromB32.substring(0, 20)}...`);
+    console.log(`[TrackerClient] Known trackers: ${this.config.trackerAddresses.length}`);
+
     const trackerIndex = this.config.trackerAddresses.findIndex(addr => {
       // If configured address is a full destination (long base64 string)
       if (addr.length > 100 && !addr.includes('.b32.i2p')) {
         // Compare full destinations directly, or convert to b32
         const addrB32 = toB32(addr);
-        return addr === from || addrB32 === fromB32;
+        const match = addr === from || addrB32 === fromB32;
+        if (!match) {
+          console.log(`[TrackerClient] No match with tracker (dest): ${addrB32.substring(0, 20)}...`);
+        }
+        return match;
       }
       // If configured address is a b32 address
       const cleanAddr = addr.replace(/\.b32\.i2p$/i, '').toLowerCase();
       const cleanFrom = fromB32.replace(/\.b32\.i2p$/i, '').toLowerCase();
-      return cleanAddr === cleanFrom;
+      const match = cleanAddr === cleanFrom;
+      if (!match) {
+        console.log(`[TrackerClient] No match with tracker (b32): ${cleanAddr.substring(0, 20)}...`);
+      }
+      return match;
     });
 
     if (trackerIndex < 0) {
+      console.log(`[TrackerClient] Message NOT from known tracker, ignoring`);
       return false; // Not a tracker message
     }
+
+    console.log(`[TrackerClient] Message IS from tracker ${trackerIndex}`);
+
 
     // Handle signed messages (new format)
     let actualMessage: TrackerMessage;
@@ -538,7 +561,11 @@ export class TrackerClient extends EventEmitter {
 
   private handlePeersList(payload: { peers: TrackerPeer[] }, trackerSigningKey?: string): void {
     const peers = payload.peers || [];
+    console.log(`[TrackerClient] ========== PEERS_LIST RECEIVED ==========`);
     console.log(`[TrackerClient] Received ${peers.length} peers from tracker${trackerSigningKey ? ' (verified)' : ''}`);
+    for (const peer of peers) {
+      console.log(`[TrackerClient]   - ${peer.displayName}: ${peer.b32Address?.substring(0, 16)}... (${peer.filesCount} files)`);
+    }
 
     // Track which peers are in the current list
     const currentPeerKeys = new Set<string>();

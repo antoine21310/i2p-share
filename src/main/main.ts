@@ -4,6 +4,7 @@ import path from 'path';
 import type { SearchFilters, SearchResult } from '../shared/types.js';
 import {
     closeDatabase,
+    FileOps,
     initDatabase,
     PeerOps,
     RemoteFileOps,
@@ -69,21 +70,79 @@ function createWindow(): void {
   });
 }
 
+/**
+ * Auto-seed new files as torrents
+ * This creates torrents for shared files that don't have an infoHash yet,
+ * enabling BitTorrent-based downloads for files found via DHT search.
+ */
+async function autoSeedNewFiles(): Promise<void> {
+  if (!torrentManager) {
+    console.log('[AutoSeed] TorrentManager not available');
+    return;
+  }
+
+  // Get files that need to be seeded (no infoHash yet)
+  const filesToSeed = FileOps.getWithoutInfoHash() as any[];
+
+  if (filesToSeed.length === 0) {
+    console.log('[AutoSeed] All files already seeded');
+    return;
+  }
+
+  console.log(`[AutoSeed] Seeding ${filesToSeed.length} new files as torrents...`);
+
+  let seeded = 0;
+  let failed = 0;
+
+  for (const file of filesToSeed) {
+    try {
+      // Check if file still exists
+      const fs = await import('fs');
+      if (!fs.existsSync(file.path)) {
+        console.log(`[AutoSeed] File not found, skipping: ${file.filename}`);
+        continue;
+      }
+
+      // Create torrent for the file
+      const result = await torrentManager.createTorrent(file.path, {
+        name: file.filename
+      });
+
+      if (result.infoHash) {
+        // Store the infoHash in the database
+        FileOps.setInfoHash(file.hash, result.infoHash);
+        seeded++;
+        console.log(`[AutoSeed] Seeded: ${file.filename} → ${result.infoHash.substring(0, 16)}...`);
+      }
+    } catch (error: any) {
+      failed++;
+      console.error(`[AutoSeed] Failed to seed ${file.filename}:`, error.message);
+    }
+  }
+
+  console.log(`[AutoSeed] Complete: ${seeded} seeded, ${failed} failed`);
+}
+
 function setupIPC(): void {
   // Search - uses DHT for distributed search
   ipcMain.handle('search:query', async (_event, query: string, filters: SearchFilters) => {
     console.log('[IPC] Search:', query, filters);
 
-    // First search local files
-    const localResults = fileIndexer.searchFiles(query).map((f: any) => ({
-      filename: f.filename,
-      fileHash: f.hash,
-      size: f.size,
-      mimeType: f.mimeType,
-      peerId: 'local',
-      peerDisplayName: 'Me (Local)',
-      addedAt: f.sharedAt
-    }));
+    // First search local files (include infoHash for torrent-based downloads)
+    const localResults = fileIndexer.searchFiles(query).map((f: any) => {
+      // Get the full file record to get the infoHash
+      const fileWithInfoHash = FileOps.getWithInfoHash(f.hash);
+      return {
+        filename: f.filename,
+        fileHash: f.hash,
+        infoHash: fileWithInfoHash?.infoHash || null, // Include torrent infoHash if available
+        size: f.size,
+        mimeType: f.mimeType,
+        peerId: 'local',
+        peerDisplayName: 'Me (Local)',
+        addedAt: f.sharedAt
+      };
+    });
 
     // DHT search for remote peers (only if connected to I2P)
     let dhtResults: SearchResult[] = [];
@@ -119,23 +178,63 @@ function setupIPC(): void {
   });
 
   // Downloads - use TorrentManager for BitTorrent-based transfers
-  ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) => {
+  ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string, providedInfoHash?: string) => {
     if (!i2pConnection.isReady()) {
       throw new Error('Not connected to I2P network');
     }
 
-    // If this is an infoHash (40 hex chars), use torrent system
-    if (fileHash.length === 40 && /^[0-9a-fA-F]+$/.test(fileHash) && torrentManager) {
-      // Add peer to torrent if it exists
-      const targetDest = streamingDest || peerId;
-      const added = await torrentManager.addPeer(fileHash, targetDest);
-      if (added) {
-        console.log(`[Main] Added peer to torrent ${fileHash.substring(0, 16)}...`);
-      }
-      return { infoHash: fileHash, name: filename };
+    if (!torrentManager) {
+      throw new Error('TorrentManager not initialized');
     }
 
-    throw new Error('Only .torrent files or magnet links are supported for downloads');
+    // Determine the infoHash to use
+    let infoHash: string | null = null;
+
+    // 1. If infoHash was provided directly, use it
+    if (providedInfoHash && providedInfoHash.length === 40 && /^[0-9a-fA-F]+$/.test(providedInfoHash)) {
+      infoHash = providedInfoHash;
+      console.log(`[Download] Using provided infoHash: ${infoHash.substring(0, 16)}...`);
+    }
+    // 2. If fileHash looks like an infoHash (40 hex chars), use it directly
+    else if (fileHash.length === 40 && /^[0-9a-fA-F]+$/.test(fileHash)) {
+      infoHash = fileHash;
+      console.log(`[Download] fileHash is infoHash format: ${infoHash.substring(0, 16)}...`);
+    }
+    // 3. Otherwise, look up the infoHash from database (fileHash -> infoHash mapping)
+    else {
+      const fileRecord = FileOps.getWithInfoHash(fileHash);
+      if (fileRecord?.infoHash) {
+        infoHash = fileRecord.infoHash;
+        console.log(`[Download] Found infoHash from database: ${infoHash.substring(0, 16)}...`);
+      }
+    }
+
+    if (!infoHash) {
+      throw new Error('This file is not available for download. The peer needs to seed it as a torrent first.');
+    }
+
+    // Add peer to the torrent swarm
+    const targetDest = streamingDest || peerId;
+    if (targetDest && targetDest !== 'local') {
+      const added = await torrentManager.addPeer(infoHash, targetDest);
+      if (added) {
+        console.log(`[Download] Added peer to torrent swarm: ${targetDest.substring(0, 20)}...`);
+      }
+    }
+
+    // Start or resume the torrent download via magnet link
+    // First check if torrent already exists
+    const existingTorrent = torrentManager.getStatus(infoHash);
+    if (existingTorrent) {
+      // Torrent exists, resume it
+      await torrentManager.resumeTorrent(infoHash);
+    } else {
+      // Create magnet link and add torrent
+      const magnetUri = `magnet:?xt=urn:btih:${infoHash}&dn=${encodeURIComponent(filename)}`;
+      await torrentManager.addMagnet(magnetUri);
+    }
+
+    return { infoHash, name: filename };
   });
 
   ipcMain.handle('download:pause', async (_event, downloadId: string) => {
@@ -292,8 +391,8 @@ function setupIPC(): void {
       totalPeers: 0
     };
 
-    // Get peer counts from database (5 minute threshold for "online")
-    const peerCounts = PeerOps.getCounts(300);
+    // Get peer counts from database (2 minute threshold for "online", aligned with tracker timeout)
+    const peerCounts = PeerOps.getCounts(120);
 
     let statusText = '';
     switch (connectionStatus) {
@@ -481,7 +580,7 @@ function setupIPC(): void {
   ipcMain.handle('peers:list', async () => {
     const peers = PeerOps.getAll() as any[];
     const now = Math.floor(Date.now() / 1000);
-    const onlineThreshold = 300; // 5 minutes
+    const onlineThreshold = 120; // 2 minutes (aligned with tracker's 90s timeout + buffer)
 
     // Add isOnline status based on lastSeen
     return peers.map(peer => ({
@@ -558,16 +657,19 @@ function setupIPC(): void {
   });
 
   ipcMain.handle('tracker:get-active', async () => {
-    // Return the first configured tracker or embedded tracker
+    // Return tracker status with actual connection state
     const addresses = store.get('trackerAddresses', []) as string[];
-    if (addresses.length > 0) {
-      return addresses[0];
-    }
-    if (embeddedTracker) {
-      const dests = embeddedTracker.getDestinations();
-      return dests.peerDiscovery || null;
-    }
-    return null;
+    const activeTracker = trackerClient.getActiveTracker();
+    const isConnected = trackerClient.isTrackerConnected();
+    const peersFromTracker = trackerClient.getPeersCount();
+
+    return {
+      address: activeTracker || (addresses.length > 0 ? addresses[0] : null),
+      isConnected: isConnected,
+      peersCount: peersFromTracker,
+      configuredCount: addresses.length,
+      hasEmbeddedTracker: !!embeddedTracker
+    };
   });
 
   ipcMain.handle('tracker:get-peers', async () => {
@@ -732,6 +834,33 @@ function setupEventForwarding(): void {
     if (i2pConnection.isReady()) {
       const files = fileIndexer.getAllFiles();
       dhtSearch.announceFiles(files);
+
+      // Update TrackerClient stats and re-announce to tracker
+      const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
+      trackerClient.updateStats(files.length, totalSize);
+      trackerClient.announce().catch(err => {
+        console.log('[Main] Re-announce after scan:', err.message);
+      });
+      console.log(`[Main] Updated tracker stats: ${files.length} files, ${totalSize} bytes`);
+
+      // Also update embedded tracker's local peer entry
+      if (embeddedTracker) {
+        embeddedTracker.registerLocalPeer({
+          destination: i2pConnection.getDestination(),
+          b32Address: i2pConnection.getB32Address(),
+          displayName: store.get('displayName', 'I2P Share User') as string,
+          filesCount: files.length,
+          totalSize: totalSize,
+          nodeId: dhtSearch.getNodeId()
+        });
+      }
+
+      // Auto-seed files as torrents (in background)
+      if (torrentManager) {
+        autoSeedNewFiles().catch(err => {
+          console.error('[Main] Auto-seed error:', err.message);
+        });
+      }
     }
   });
 
@@ -1213,9 +1342,30 @@ async function startI2PAndConnect(): Promise<void> {
           }
         };
 
+        // Periodically refresh local peer entry to prevent it from becoming stale
+        const refreshLocalPeer = () => {
+          if (!embeddedTracker || !i2pConnection.isReady()) return;
+
+          const files = fileIndexer.getAllFiles();
+          const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
+          const storedDisplayName = store.get('displayName', 'I2P Share User') as string;
+
+          embeddedTracker.registerLocalPeer({
+            destination: result.destination,
+            b32Address: result.b32Address,
+            displayName: storedDisplayName,
+            filesCount: files.length,
+            totalSize: totalSize,
+            nodeId: dhtSearch.getNodeId()
+          });
+        };
+
         // Sync immediately and then every 10 seconds
         syncTrackerPeers();
         setInterval(syncTrackerPeers, 10000);
+
+        // Refresh local peer every 30 seconds to keep it active
+        setInterval(refreshLocalPeer, 30000);
 
       } catch (err: any) {
         console.error('[Main] Failed to start EmbeddedTracker:', err.message);

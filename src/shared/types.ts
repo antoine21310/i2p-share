@@ -20,6 +20,7 @@ export interface FileInfo {
 export interface SearchResult {
   filename: string;
   fileHash: string;
+  infoHash?: string | null; // BitTorrent infoHash for torrent-based downloads
   size: number;
   mimeType: string;
   peerId: string;

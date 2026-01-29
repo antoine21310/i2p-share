@@ -11,13 +11,21 @@ interface EmbeddedTrackerStatus {
   uptime: number;
 }
 
+interface TrackerStatus {
+  address: string | null;
+  isConnected: boolean;
+  peersCount: number;
+  configuredCount: number;
+  hasEmbeddedTracker: boolean;
+}
+
 export function SettingsPage() {
   const { networkStatus } = useStore();
   const [displayName, setDisplayName] = useState('');
   const [displayNameSaving, setDisplayNameSaving] = useState(false);
   const [displayNameSaved, setDisplayNameSaved] = useState(false);
   const [trackerAddresses, setTrackerAddresses] = useState('');
-  const [activeTracker, setActiveTracker] = useState<string | null>(null);
+  const [trackerStatus, setTrackerStatus] = useState<TrackerStatus | null>(null);
   const [trackerSaving, setTrackerSaving] = useState(false);
   const [trackerSaved, setTrackerSaved] = useState(false);
 
@@ -44,17 +52,18 @@ export function SettingsPage() {
     window.electron.getTrackerAddresses().then((addresses: string[]) => {
       setTrackerAddresses(addresses.join('\n'));
     });
-    window.electron.getActiveTracker().then(setActiveTracker);
+    window.electron.getActiveTracker().then(setTrackerStatus);
 
     // Load embedded tracker settings
     window.electron.getEmbeddedTrackerEnabled().then(setEmbeddedTrackerEnabled);
     window.electron.getEmbeddedTrackerStatus().then(setEmbeddedTrackerStatus);
   }, []);
 
-  // Refresh embedded tracker status periodically
+  // Refresh tracker statuses periodically
   useEffect(() => {
     const interval = setInterval(() => {
       window.electron.getEmbeddedTrackerStatus().then(setEmbeddedTrackerStatus);
+      window.electron.getActiveTracker().then(setTrackerStatus);
     }, 5000);
     return () => clearInterval(interval);
   }, []);
@@ -89,7 +98,7 @@ export function SettingsPage() {
       setTrackerSaved(true);
       setTimeout(() => setTrackerSaved(false), 2000);
       // Refresh active tracker
-      window.electron.getActiveTracker().then(setActiveTracker);
+      window.electron.getActiveTracker().then(setTrackerStatus);
     } finally {
       setTrackerSaving(false);
     }
@@ -236,11 +245,23 @@ export function SettingsPage() {
           </h2>
           <div className="card p-6 space-y-4">
             {/* Active tracker status */}
-            {activeTracker && (
-              <div className="flex items-center gap-2 text-sm">
-                <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                <span className="text-dark-400">Connected to:</span>
-                <code className="text-primary-400 text-xs">{activeTracker.substring(0, 32)}...</code>
+            {trackerStatus && (
+              <div className="p-3 bg-dark-800/50 rounded-lg border border-dark-600 space-y-2">
+                <div className="flex items-center gap-2 text-sm">
+                  <div className={`w-2 h-2 rounded-full ${trackerStatus.isConnected ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`} />
+                  <span className="text-dark-400">
+                    {trackerStatus.isConnected ? 'Connected to tracker' : 'Configured (not connected)'}
+                  </span>
+                </div>
+                {trackerStatus.address && (
+                  <code className="block text-primary-400 text-xs break-all">
+                    {trackerStatus.address.substring(0, 40)}...
+                  </code>
+                )}
+                <div className="flex gap-4 text-xs text-dark-500">
+                  <span>Peers from tracker: {trackerStatus.peersCount}</span>
+                  <span>Configured: {trackerStatus.configuredCount} tracker(s)</span>
+                </div>
               </div>
             )}
 

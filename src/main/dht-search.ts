@@ -501,15 +501,20 @@ export class DHTSearchEngine extends EventEmitter {
         }
         return true;
       })
-      .map((file: any) => ({
-        filename: file.filename,
-        fileHash: file.hash,
-        size: file.size,
-        mimeType: file.mimeType,
-        peerId: this.destination,
-        peerDisplayName: 'Me',
-        addedAt: file.sharedAt
-      }));
+      .map((file: any) => {
+        // Get full file record to include infoHash for torrent-based downloads
+        const fileWithInfoHash = FileOps.getWithInfoHash(file.hash);
+        return {
+          filename: file.filename,
+          fileHash: file.hash,
+          infoHash: fileWithInfoHash?.infoHash || null, // Include torrent infoHash if available
+          size: file.size,
+          mimeType: file.mimeType,
+          peerId: this.destination,
+          peerDisplayName: 'Me',
+          addedAt: file.sharedAt
+        };
+      });
   }
 
   private getFileCategory(mimeType: string): string {

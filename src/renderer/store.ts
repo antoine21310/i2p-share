@@ -9,6 +9,7 @@ import { formatBytes } from './utils/format';
 interface SearchResult {
   filename: string;
   fileHash: string;
+  infoHash?: string | null; // BitTorrent infoHash for torrent-based downloads
   size: number;
   mimeType: string;
   peerId: string;
@@ -193,7 +194,8 @@ export const useStore = create<AppStore>((set, get) => ({
         result.filename,
         result.size,
         result.peerDisplayName || 'Unknown Peer',
-        result.streamingDestination
+        result.streamingDestination,
+        result.infoHash || undefined // Pass infoHash for torrent-based downloads
       );
 
       notify.success('Download started', result.filename);

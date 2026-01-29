@@ -328,6 +328,36 @@ export const FileOps = {
   setShared: (hash: string, shared: boolean) => {
     const db = getDatabase();
     return db.prepare('UPDATE local_files SET isShared = ? WHERE hash = ?').run(shared ? 1 : 0, hash);
+  },
+
+  // Update infoHash for a file (after torrent is created)
+  setInfoHash: (fileHash: string, infoHash: string) => {
+    const db = getDatabase();
+    return db.prepare('UPDATE local_files SET infoHash = ? WHERE hash = ?').run(infoHash, fileHash);
+  },
+
+  // Get file by infoHash
+  getByInfoHash: (infoHash: string) => {
+    const db = getDatabase();
+    return db.prepare('SELECT * FROM local_files WHERE infoHash = ? AND isShared = 1').get(infoHash);
+  },
+
+  // Get files without infoHash (need to be seeded)
+  getWithoutInfoHash: () => {
+    const db = getDatabase();
+    return db.prepare('SELECT * FROM local_files WHERE isShared = 1 AND (infoHash IS NULL OR infoHash = "")').all();
+  },
+
+  // Get file with its infoHash for downloads
+  getWithInfoHash: (fileHash: string) => {
+    const db = getDatabase();
+    return db.prepare('SELECT * FROM local_files WHERE hash = ? AND isShared = 1').get(fileHash) as {
+      path: string;
+      filename: string;
+      hash: string;
+      size: number;
+      infoHash: string | null
+    } | undefined;
   }
 };
 
