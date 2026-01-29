@@ -24,10 +24,15 @@ interface TrackerPeer {
 }
 
 interface TrackerMessage {
-  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG' | 'DISCONNECT';
+  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG' | 'DISCONNECT' | 'GET_DHT_NODES' | 'DHT_NODES_LIST' | 'PEER_ONLINE' | 'PEER_OFFLINE';
   payload: any;
   timestamp: number;
   _from?: string;
+}
+
+interface DHTNode {
+  nodeId: string;
+  destination: string;
 }
 
 interface TrackerClientConfig {
@@ -35,6 +40,7 @@ interface TrackerClientConfig {
   announceInterval: number;
   refreshInterval: number;
   connectionTimeout: number;
+  heartbeatInterval: number; // Interval for sending PING to tracker (heartbeat)
 }
 
 // Default community trackers (can be overridden by user)
@@ -54,6 +60,7 @@ export class TrackerClient extends EventEmitter {
   private totalSize: number = 0;
   private announceTimer: NodeJS.Timeout | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   private knownPeers: Map<string, TrackerPeer> = new Map();
   private isConnected: boolean = false;
   private activeTrackerIndex: number = -1;
@@ -61,6 +68,7 @@ export class TrackerClient extends EventEmitter {
   private lastResponseTime: Map<string, number> = new Map();
   private signingKeys: SigningKeypair | null = null;
   private usedNonces: Set<string> = new Set(); // Replay attack protection
+  private nodeId: string = ''; // DHT node ID for bootstrap
 
   constructor(config: Partial<TrackerClientConfig> = {}) {
     super();
@@ -68,7 +76,8 @@ export class TrackerClient extends EventEmitter {
       trackerAddresses: config.trackerAddresses || [...DEFAULT_TRACKERS],
       announceInterval: config.announceInterval || 2 * 60 * 1000,
       refreshInterval: config.refreshInterval || 60 * 1000,
-      connectionTimeout: config.connectionTimeout || 30 * 1000
+      connectionTimeout: config.connectionTimeout || 30 * 1000,
+      heartbeatInterval: config.heartbeatInterval || 60 * 1000 // 60 seconds heartbeat
     };
 
     // Load or generate signing keys
@@ -170,6 +179,14 @@ export class TrackerClient extends EventEmitter {
     console.log(`[TrackerClient] Streaming destination set: ${destination.substring(0, 30)}...`);
   }
 
+  /**
+   * Set the DHT node ID for bootstrap purposes
+   */
+  setNodeId(nodeId: string): void {
+    this.nodeId = nodeId;
+    console.log(`[TrackerClient] DHT node ID set: ${nodeId.substring(0, 16)}...`);
+  }
+
   setDisplayName(name: string): void {
     this.displayName = name || 'I2P Share User';
     console.log(`[TrackerClient] Display name set: ${this.displayName}`);
@@ -241,6 +258,9 @@ export class TrackerClient extends EventEmitter {
     // Request peer list - the response also confirms announce was received
     await this.requestPeers();
 
+    // Request DHT nodes for bootstrap (enables decentralized discovery)
+    await this.requestDHTNodes();
+
     // Start periodic tasks
     this.startPeriodicTasks();
 
@@ -271,6 +291,11 @@ export class TrackerClient extends EventEmitter {
       this.requestPeers();
       this.checkTrackerHealth();
     }, addJitter(this.config.refreshInterval));
+
+    // Heartbeat (PING) every 60 seconds to maintain presence
+    this.heartbeatTimer = setInterval(() => {
+      this.sendPing();
+    }, addJitter(this.config.heartbeatInterval));
   }
 
   private stopPeriodicTasks(): void {
@@ -281,6 +306,10 @@ export class TrackerClient extends EventEmitter {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 
@@ -368,6 +397,11 @@ export class TrackerClient extends EventEmitter {
       payload.streamingDestination = this.streamingDestination;
     }
 
+    // Include DHT node ID for bootstrap (allows tracker to provide DHT nodes to new clients)
+    if (this.nodeId) {
+      payload.nodeId = this.nodeId;
+    }
+
     const message: TrackerMessage = {
       type: 'ANNOUNCE',
       payload,
@@ -398,6 +432,26 @@ export class TrackerClient extends EventEmitter {
       console.log('[TrackerClient] Requested peer list from tracker');
     } catch (error: any) {
       console.error('[TrackerClient] Request peers failed:', error.message);
+    }
+  }
+
+  /**
+   * Send PING to tracker as heartbeat to maintain presence
+   */
+  async sendPing(): Promise<void> {
+    const tracker = this.getActiveTracker();
+    if (!this.sendMessage || !tracker) return;
+
+    const message: TrackerMessage = {
+      type: 'PING',
+      payload: {},
+      timestamp: Date.now()
+    };
+
+    try {
+      await this.sendSignedMessage(tracker, message);
+    } catch (error: any) {
+      console.error('[TrackerClient] Ping failed:', error.message);
     }
   }
 
@@ -465,8 +519,17 @@ export class TrackerClient extends EventEmitter {
       case 'PEERS_LIST':
         this.handlePeersList(actualMessage.payload, signingKey);
         return true;
+      case 'DHT_NODES_LIST':
+        this.handleDHTNodesList(actualMessage.payload);
+        return true;
       case 'PONG':
         console.log('[TrackerClient] Received PONG from tracker');
+        return true;
+      case 'PEER_ONLINE':
+        this.handlePeerOnline(actualMessage.payload);
+        return true;
+      case 'PEER_OFFLINE':
+        this.handlePeerOffline(actualMessage.payload);
         return true;
       default:
         return false;
@@ -513,6 +576,90 @@ export class TrackerClient extends EventEmitter {
     }
 
     this.emit('peers:updated', Array.from(this.knownPeers.values()));
+  }
+
+  /**
+   * Handle DHT_NODES_LIST message - emits event for DHT bootstrap
+   */
+  private handleDHTNodesList(payload: { nodes: DHTNode[] }): void {
+    const nodes = payload.nodes || [];
+    console.log(`[TrackerClient] Received ${nodes.length} DHT nodes for bootstrap`);
+
+    if (nodes.length > 0) {
+      // Emit event so main.ts can use these nodes to bootstrap the DHT
+      this.emit('dht:nodes', nodes);
+    }
+  }
+
+  /**
+   * Handle PEER_ONLINE notification - a new peer joined the network
+   */
+  private handlePeerOnline(payload: TrackerPeer): void {
+    if (!payload.destination || !payload.b32Address) return;
+
+    const key = payload.b32Address || payload.destination;
+    const existing = this.knownPeers.get(key);
+
+    // Update or add to known peers
+    this.knownPeers.set(key, {
+      ...payload,
+      lastSeen: Date.now()
+    } as TrackerPeer & { lastSeen: number });
+
+    console.log(`[TrackerClient] Peer online: ${payload.b32Address.substring(0, 16)}... (${payload.displayName || 'Unknown'})`);
+
+    // Emit event for real-time UI update
+    this.emit('peer:online', payload);
+
+    // Also emit peer:discovered for new peers
+    if (!existing) {
+      this.emit('peer:discovered', payload);
+    }
+
+    // Emit updated peers list
+    this.emit('peers:updated', Array.from(this.knownPeers.values()));
+  }
+
+  /**
+   * Handle PEER_OFFLINE notification - a peer left the network
+   */
+  private handlePeerOffline(payload: { destination: string; b32Address: string }): void {
+    if (!payload.destination && !payload.b32Address) return;
+
+    const key = payload.b32Address || payload.destination;
+    const peer = this.knownPeers.get(key);
+
+    if (peer) {
+      console.log(`[TrackerClient] Peer offline: ${payload.b32Address.substring(0, 16)}...`);
+      this.knownPeers.delete(key);
+
+      // Emit event for real-time UI update
+      this.emit('peer:offline', { ...peer, ...payload });
+
+      // Emit updated peers list
+      this.emit('peers:updated', Array.from(this.knownPeers.values()));
+    }
+  }
+
+  /**
+   * Request DHT nodes from tracker for bootstrap
+   */
+  async requestDHTNodes(): Promise<void> {
+    const tracker = this.getActiveTracker();
+    if (!this.sendMessage || !tracker) return;
+
+    const message: TrackerMessage = {
+      type: 'GET_DHT_NODES',
+      payload: {},
+      timestamp: Date.now()
+    };
+
+    try {
+      await this.sendSignedMessage(tracker, message);
+      console.log('[TrackerClient] Requested DHT nodes from tracker');
+    } catch (error: any) {
+      console.error('[TrackerClient] Request DHT nodes failed:', error.message);
+    }
   }
 
   getPeers(): TrackerPeer[] {

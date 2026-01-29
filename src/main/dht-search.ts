@@ -122,6 +122,20 @@ export class DHTSearchEngine extends EventEmitter {
     this.messageHandler = handler;
   }
 
+  /**
+   * Get this node's DHT ID
+   */
+  getNodeId(): string {
+    return this.nodeId;
+  }
+
+  /**
+   * Get this node's destination
+   */
+  getDestination(): string {
+    return this.destination;
+  }
+
   // Calculate XOR distance between two node IDs
   private xorDistance(id1: string, id2: string): bigint {
     const hex1 = BigInt('0x' + id1);
@@ -892,6 +906,124 @@ export class DHTSearchEngine extends EventEmitter {
         this.torrentPeers.delete(infoHash);
       }
     }
+  }
+
+  // ============================================================================
+  // Tracker Discovery via DHT
+  // ============================================================================
+
+  /** Special DHT key for tracker discovery */
+  private static readonly TRACKER_DHT_KEY = 'i2p-share-trackers';
+
+  /**
+   * Hash the tracker discovery key to get a consistent infoHash
+   */
+  getTrackerDiscoveryHash(): string {
+    return crypto.createHash('sha1')
+      .update(DHTSearchEngine.TRACKER_DHT_KEY)
+      .digest('hex');
+  }
+
+  /**
+   * Announce a tracker to the DHT so others can discover it
+   * @param trackerDestination The I2P destination of the tracker
+   */
+  async announceTracker(trackerDestination: string): Promise<void> {
+    const trackerHash = this.getTrackerDiscoveryHash();
+    console.log(`[DHT] Announcing tracker ${trackerDestination.substring(0, 30)}... to DHT`);
+
+    // Store the tracker in our local peer storage (with tracker hash as infoHash)
+    let trackers = this.torrentPeers.get(trackerHash);
+    if (!trackers) {
+      trackers = new Map();
+      this.torrentPeers.set(trackerHash, trackers);
+    }
+    trackers.set(trackerDestination, {
+      destination: trackerDestination,
+      lastSeen: Date.now()
+    });
+
+    // Announce to DHT like a regular peer announcement
+    // First, get tokens from closest nodes
+    const closestNodes = this.getClosestNodes(trackerHash, K);
+
+    for (const node of closestNodes) {
+      const message: DHTMessage = {
+        type: 'GET_PEERS',
+        nodeId: this.nodeId,
+        payload: {
+          infoHash: trackerHash,
+          origin: this.destination
+        },
+        timestamp: Date.now()
+      };
+
+      if (this.messageHandler) {
+        this.messageHandler(node.destination, message);
+      }
+    }
+
+    // Wait for tokens
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    // Announce with the tracker destination (not our own destination)
+    let announcedCount = 0;
+    for (const node of closestNodes) {
+      const token = this.tokenCache.get(node.nodeId) || this.tokenCache.get(node.destination);
+      if (!token) continue;
+
+      const message: DHTMessage = {
+        type: 'ANNOUNCE_PEER',
+        nodeId: this.nodeId,
+        payload: {
+          infoHash: trackerHash,
+          port: trackerDestination, // The tracker's destination
+          token,
+          origin: this.destination
+        },
+        timestamp: Date.now()
+      };
+
+      if (this.messageHandler) {
+        this.messageHandler(node.destination, message);
+        announcedCount++;
+      }
+    }
+
+    console.log(`[DHT] Tracker announced to ${announcedCount} DHT nodes`);
+    this.emit('tracker:announced', { destination: trackerDestination });
+  }
+
+  /**
+   * Discover trackers from the DHT
+   * @param timeout Timeout in ms
+   * @returns Array of tracker destinations
+   */
+  async discoverTrackers(timeout = 15000): Promise<string[]> {
+    const trackerHash = this.getTrackerDiscoveryHash();
+    console.log(`[DHT] Discovering trackers from DHT...`);
+
+    // Use the existing getPeers mechanism with the tracker hash
+    const trackers = await this.getPeers(trackerHash, timeout);
+
+    // Filter out our own destination and duplicates
+    const uniqueTrackers = [...new Set(trackers)].filter(t => t !== this.destination);
+
+    console.log(`[DHT] Discovered ${uniqueTrackers.length} trackers from DHT`);
+
+    if (uniqueTrackers.length > 0) {
+      this.emit('trackers:discovered', uniqueTrackers);
+    }
+
+    return uniqueTrackers;
+  }
+
+  /**
+   * Get locally known trackers
+   */
+  getKnownTrackers(): string[] {
+    const trackerHash = this.getTrackerDiscoveryHash();
+    return this.getStoredPeers(trackerHash);
   }
 
   /**

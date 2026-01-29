@@ -32,9 +32,14 @@ export function TitleBar() {
           }`} />
           <span className="text-sm text-dark-400">
             {networkStatus.isConnected
-              ? `${networkStatus.peersConnected} peers`
+              ? `${networkStatus.peersConnected || 0} online`
               : networkStatus.statusText || 'Connecting...'}
           </span>
+          {networkStatus.isConnected && (networkStatus.peersTotal || 0) > 0 && (
+            <span className="text-sm text-dark-500">
+              / {networkStatus.peersTotal} known
+            </span>
+          )}
         </div>
       </div>
 

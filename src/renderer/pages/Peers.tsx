@@ -20,6 +20,10 @@ export function PeersPage() {
     return () => clearInterval(interval);
   }, []);
 
+  // Separate online and offline peers
+  const onlinePeers = peers.filter(p => p.isOnline);
+  const offlinePeers = peers.filter(p => !p.isOnline);
+
   const handleViewFiles = async (peerId: string) => {
     if (selectedPeer === peerId) {
       // Toggle off
@@ -60,12 +64,12 @@ export function PeersPage() {
         <div className="mb-8">
           <h1 className="text-2xl font-bold text-white mb-2">Network Peers</h1>
           <p className="text-dark-400">
-            {peers.length} peer{peers.length !== 1 ? 's' : ''} online
+            {onlinePeers.length} online, {offlinePeers.length} offline ({peers.length} total discovered)
           </p>
         </div>
 
         {/* Network stats */}
-        <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className="grid grid-cols-4 gap-4 mb-8">
           <div className="card p-4">
             <div className="flex items-center gap-3">
               <div className={`w-3 h-3 rounded-full ${networkStatus.isConnected ? 'status-online' : 'status-offline'}`} />
@@ -83,19 +87,53 @@ export function PeersPage() {
           </div>
           <div className="card p-4">
             <div className="text-dark-400 text-sm mb-1">Online Peers</div>
-            <div className="text-2xl font-bold text-green-400">{peers.length}</div>
+            <div className="text-2xl font-bold text-green-400">{onlinePeers.length}</div>
+          </div>
+          <div className="card p-4">
+            <div className="text-dark-400 text-sm mb-1">Known Peers</div>
+            <div className="text-2xl font-bold text-dark-300">{peers.length}</div>
           </div>
         </div>
 
         {/* Online peers */}
-        {peers.length > 0 && (
+        {onlinePeers.length > 0 && (
           <section className="mb-8">
             <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
               <div className="w-2 h-2 rounded-full status-online" />
-              Connected Peers
+              Online Peers ({onlinePeers.length})
             </h2>
             <div className="space-y-4">
-              {peers.map(peer => (
+              {onlinePeers.map(peer => (
+                <div key={peer.peerId}>
+                  <PeerCard
+                    peer={peer}
+                    isExpanded={selectedPeer === peer.peerId}
+                    onViewFiles={() => handleViewFiles(peer.peerId)}
+                  />
+                  {selectedPeer === peer.peerId && (
+                    <PeerFilesPanel
+                      files={peerFiles}
+                      loading={loadingFiles}
+                      peerName={peer.displayName}
+                      peerId={peer.peerId}
+                      streamingDestination={(peer as any).streamingDestination}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Offline peers */}
+        {offlinePeers.length > 0 && (
+          <section className="mb-8">
+            <h2 className="text-lg font-semibold text-dark-400 mb-4 flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full bg-dark-500" />
+              Offline Peers ({offlinePeers.length})
+            </h2>
+            <div className="space-y-4 opacity-60">
+              {offlinePeers.map(peer => (
                 <div key={peer.peerId}>
                   <PeerCard
                     peer={peer}
@@ -165,19 +203,32 @@ function PeerCard({ peer, isExpanded, onViewFiles }: PeerCardProps) {
   const colorIndex = peer.peerId.charCodeAt(0) % colors.length;
   const gradientClass = colors[colorIndex];
 
+  // Format last seen time
+  const formatLastSeen = (timestamp: number) => {
+    if (!timestamp) return 'Unknown';
+    const seconds = Math.floor(Date.now() / 1000) - timestamp;
+    if (seconds < 60) return 'Just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
+  };
+
   return (
-    <div className={`card p-4 border-green-500/20 ${isExpanded ? 'border-primary-500/50' : ''}`}>
+    <div className={`card p-4 ${peer.isOnline ? 'border-green-500/20' : 'border-dark-700'} ${isExpanded ? 'border-primary-500/50' : ''}`}>
       <div className="flex items-start gap-4">
         {/* Avatar */}
-        <div className={`w-12 h-12 rounded-xl bg-gradient-to-br ${gradientClass} flex items-center justify-center text-white font-bold text-lg`}>
+        <div className={`w-12 h-12 rounded-xl bg-gradient-to-br ${gradientClass} ${!peer.isOnline ? 'opacity-50 grayscale' : ''} flex items-center justify-center text-white font-bold text-lg`}>
           {peer.displayName.charAt(0).toUpperCase()}
         </div>
 
         {/* Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-semibold text-white truncate">{peer.displayName}</h3>
-            <div className="w-2 h-2 rounded-full status-online" />
+            <h3 className={`font-semibold truncate ${peer.isOnline ? 'text-white' : 'text-dark-400'}`}>{peer.displayName}</h3>
+            <div className={`w-2 h-2 rounded-full ${peer.isOnline ? 'status-online' : 'bg-dark-500'}`} />
+            {!peer.isOnline && (
+              <span className="text-xs text-dark-500">Last seen: {formatLastSeen((peer as any).lastSeen)}</span>
+            )}
           </div>
           <div className="text-sm text-dark-400 mt-1">
             {peer.filesCount.toLocaleString()} files ({formatBytes(peer.totalSize)})

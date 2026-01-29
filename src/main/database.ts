@@ -440,7 +440,36 @@ export const PeerOps = {
   getOnline: (threshold = 300) => {
     const db = getDatabase();
     const cutoff = Math.floor(Date.now() / 1000) - threshold;
-    return db.prepare('SELECT * FROM peers WHERE lastSeen > ? AND isBlocked = 0').all(cutoff);
+    return db.prepare('SELECT * FROM peers WHERE lastSeen > ? AND isBlocked = 0 ORDER BY lastSeen DESC').all(cutoff);
+  },
+
+  getOffline: (threshold = 300) => {
+    const db = getDatabase();
+    const cutoff = Math.floor(Date.now() / 1000) - threshold;
+    return db.prepare('SELECT * FROM peers WHERE lastSeen <= ? AND isBlocked = 0 ORDER BY lastSeen DESC').all(cutoff);
+  },
+
+  getCounts: (threshold = 300) => {
+    const db = getDatabase();
+    const cutoff = Math.floor(Date.now() / 1000) - threshold;
+    const online = db.prepare('SELECT COUNT(*) as count FROM peers WHERE lastSeen > ? AND isBlocked = 0').get(cutoff) as { count: number };
+    const total = db.prepare('SELECT COUNT(*) as count FROM peers WHERE isBlocked = 0').get() as { count: number };
+    return {
+      online: online?.count || 0,
+      offline: (total?.count || 0) - (online?.count || 0),
+      total: total?.count || 0
+    };
+  },
+
+  updateLastSeen: (peerId: string, timestamp?: number) => {
+    const db = getDatabase();
+    const ts = timestamp || Math.floor(Date.now() / 1000);
+    return db.prepare('UPDATE peers SET lastSeen = ? WHERE peerId = ?').run(ts, peerId);
+  },
+
+  delete: (peerId: string) => {
+    const db = getDatabase();
+    return db.prepare('DELETE FROM peers WHERE peerId = ?').run(peerId);
   }
 };
 

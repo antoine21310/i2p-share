@@ -51,7 +51,10 @@ interface Peer {
 interface NetworkStatus {
   isConnected: boolean;
   activeTunnels: number;
-  peersConnected: number;
+  peersConnected: number;   // Online peers (seen recently)
+  peersOnline: number;      // Same as peersConnected
+  peersOffline: number;     // Offline peers (not seen recently)
+  peersTotal: number;       // Total discovered peers
   uploadSpeed: number;
   downloadSpeed: number;
   statusText: string;
@@ -304,6 +307,9 @@ export const useStore = create<AppStore>((set, get) => ({
     isConnected: false,
     activeTunnels: 0,
     peersConnected: 0,
+    peersOnline: 0,
+    peersOffline: 0,
+    peersTotal: 0,
     uploadSpeed: 0,
     downloadSpeed: 0,
     statusText: 'Connecting to I2P...'
@@ -434,6 +440,69 @@ export const useStore = create<AppStore>((set, get) => ({
       }),
       window.electron.on('peers:updated', () => {
         get().fetchPeers();
+      }),
+      // Real-time peer presence events
+      window.electron.on('peer:online', (data: any) => {
+        // Update peer status in-place for instant UI update
+        set(state => {
+          const existingPeerIndex = state.peers.findIndex(p =>
+            p.peerId === data.peerId || p.peerId === data.b32Address
+          );
+
+          if (existingPeerIndex >= 0) {
+            // Update existing peer to online
+            const updatedPeers = [...state.peers];
+            updatedPeers[existingPeerIndex] = {
+              ...updatedPeers[existingPeerIndex],
+              isOnline: true,
+              lastSeen: Math.floor(Date.now() / 1000),
+              displayName: data.displayName || updatedPeers[existingPeerIndex].displayName,
+              filesCount: data.filesCount || updatedPeers[existingPeerIndex].filesCount,
+              totalSize: data.totalSize || updatedPeers[existingPeerIndex].totalSize
+            };
+            return { peers: updatedPeers };
+          } else {
+            // Add new peer
+            const newPeer: Peer = {
+              peerId: data.peerId || data.b32Address,
+              displayName: data.displayName || 'Unknown',
+              filesCount: data.filesCount || 0,
+              totalSize: data.totalSize || 0,
+              isOnline: true,
+              lastSeen: Math.floor(Date.now() / 1000),
+              streamingDestination: data.streamingDestination
+            };
+            return { peers: [...state.peers, newPeer] };
+          }
+        });
+
+        // Also update network status counts
+        get().fetchNetworkStatus();
+
+        // Optional: Show notification for new peer
+        notify.info('Peer online', data.displayName || 'A new peer joined the network');
+      }),
+      window.electron.on('peer:offline', (data: any) => {
+        // Update peer status in-place for instant UI update
+        set(state => {
+          const updatedPeers = state.peers.map(peer => {
+            if (peer.peerId === data.peerId || peer.peerId === data.b32Address) {
+              return {
+                ...peer,
+                isOnline: false,
+                lastSeen: Math.floor(Date.now() / 1000) - 600 // Mark as offline (10 mins ago)
+              };
+            }
+            return peer;
+          });
+          return { peers: updatedPeers };
+        });
+
+        // Also update network status counts
+        get().fetchNetworkStatus();
+
+        // Optional: Show notification
+        notify.info('Peer offline', data.displayName || 'A peer left the network');
       })
     );
 

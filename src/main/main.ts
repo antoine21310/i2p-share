@@ -16,6 +16,7 @@ import { i2pConnection } from './i2p-connection.js';
 import { i2pdManager } from './i2pd-manager.js';
 import { EmbeddedTracker, getEmbeddedTracker } from './torrent/embedded-tracker.js';
 import { getTorrentManager, TorrentManager } from './torrent/torrent-manager.js';
+import { trackerClient, DEFAULT_TRACKERS } from './tracker-client.js';
 
 // Get electron from global (set by bootstrap.cjs)
 const electron = (globalThis as any).__electron;
@@ -291,6 +292,9 @@ function setupIPC(): void {
       totalPeers: 0
     };
 
+    // Get peer counts from database (5 minute threshold for "online")
+    const peerCounts = PeerOps.getCounts(300);
+
     let statusText = '';
     switch (connectionStatus) {
       case 'disconnected':
@@ -319,7 +323,11 @@ function setupIPC(): void {
     return {
       isConnected: connectionStatus === 'connected',
       activeTunnels,
-      peersConnected: torrentStats.totalPeers,
+      // Peer counts: online = seen in last 5 mins, total = all discovered peers
+      peersConnected: peerCounts.online,      // Online peers (seen recently)
+      peersOnline: peerCounts.online,         // Same, explicit name
+      peersOffline: peerCounts.offline,       // Offline peers (not seen recently)
+      peersTotal: peerCounts.total,           // Total discovered peers
       uploadSpeed: torrentStats.totalUploadSpeed,
       downloadSpeed: torrentStats.totalDownloadSpeed,
       totalUploaded: 0,
@@ -471,7 +479,15 @@ function setupIPC(): void {
 
   // ==================== PEERS ====================
   ipcMain.handle('peers:list', async () => {
-    return PeerOps.getAll();
+    const peers = PeerOps.getAll() as any[];
+    const now = Math.floor(Date.now() / 1000);
+    const onlineThreshold = 300; // 5 minutes
+
+    // Add isOnline status based on lastSeen
+    return peers.map(peer => ({
+      ...peer,
+      isOnline: peer.lastSeen && (now - peer.lastSeen) < onlineThreshold
+    }));
   });
 
   ipcMain.handle('peers:get-files', async (_event, peerId: string) => {
@@ -755,6 +771,229 @@ function setupEventForwarding(): void {
   });
 }
 
+// Track known trackers to avoid duplicate connections
+const knownTrackerDestinations = new Set<string>();
+let trackerDiscoveryInterval: NodeJS.Timeout | null = null;
+
+/**
+ * Bootstrap DHT via tracker for initial peer discovery.
+ * This enables new clients to discover peers even with an empty DHT.
+ * Also sets up automatic tracker discovery and propagation.
+ */
+async function bootstrapDHTViaTracker(destination: string, displayName: string): Promise<void> {
+  // Get configured trackers (from settings or defaults)
+  const configuredTrackers = store.get('trackerAddresses', []) as string[];
+  const allTrackers = [...configuredTrackers, ...DEFAULT_TRACKERS].filter(t => t && t.trim().length > 0);
+
+  // Add configured trackers to known set
+  for (const tracker of allTrackers) {
+    knownTrackerDestinations.add(tracker);
+  }
+
+  // Configure TrackerClient
+  trackerClient.setIdentity(destination, displayName);
+  trackerClient.setNodeId(dhtSearch.getNodeId());
+  trackerClient.setMessageHandler(async (dest, msg) => {
+    return i2pConnection.sendMessage(dest, msg);
+  });
+
+  // Listen for DHT nodes from tracker
+  trackerClient.on('dht:nodes', async (nodes: { nodeId: string; destination: string }[]) => {
+    console.log(`[Main] Received ${nodes.length} DHT nodes from tracker for bootstrap`);
+
+    // Filter valid nodes and bootstrap DHT
+    const validNodes = nodes.filter(n => n.destination && n.destination.length > 50);
+
+    if (validNodes.length > 0) {
+      try {
+        await dhtSearch.bootstrap(validNodes);
+        console.log(`[Main] DHT bootstrapped with ${validNodes.length} nodes from tracker`);
+      } catch (err: any) {
+        console.error('[Main] DHT bootstrap failed:', err.message);
+      }
+    }
+  });
+
+  // Listen for peers discovered (they can also be used for DHT)
+  trackerClient.on('peers:updated', (peers: any[]) => {
+    console.log(`[Main] Tracker discovered ${peers.length} peers`);
+    // Peers can be used as DHT nodes too
+    const peerNodes = peers
+      .filter(p => p.destination && p.destination.length > 50)
+      .map(p => ({ nodeId: '', destination: p.destination }));
+
+    if (peerNodes.length > 0) {
+      dhtSearch.bootstrap(peerNodes).catch(err => {
+        console.log('[Main] Peer-based DHT bootstrap:', err.message);
+      });
+    }
+  });
+
+  // Listen for real-time peer online notifications
+  trackerClient.on('peer:online', (peer: any) => {
+    console.log(`[Main] Peer came online: ${peer.displayName || peer.b32Address?.substring(0, 16)}...`);
+
+    // Update peer in database with current timestamp
+    const now = Math.floor(Date.now() / 1000);
+    PeerOps.upsert({
+      peerId: peer.destination || peer.b32Address,
+      displayName: peer.displayName || 'Unknown',
+      filesCount: peer.filesCount || 0,
+      totalSize: peer.totalSize || 0,
+      lastSeen: now,
+      isOnline: true
+    });
+
+    // Send real-time update to renderer
+    mainWindow?.webContents.send('peer:online', {
+      peerId: peer.destination || peer.b32Address,
+      b32Address: peer.b32Address,
+      displayName: peer.displayName || 'Unknown',
+      filesCount: peer.filesCount || 0,
+      totalSize: peer.totalSize || 0,
+      streamingDestination: peer.streamingDestination
+    });
+  });
+
+  // Listen for real-time peer offline notifications
+  trackerClient.on('peer:offline', (peer: any) => {
+    console.log(`[Main] Peer went offline: ${peer.displayName || peer.b32Address?.substring(0, 16)}...`);
+
+    // Update peer in database - mark as offline by setting lastSeen to a past timestamp
+    // This ensures getCounts() properly categorizes them as offline
+    const offlineTimestamp = Math.floor(Date.now() / 1000) - 600; // 10 minutes ago
+    PeerOps.updateLastSeen(peer.destination || peer.b32Address, offlineTimestamp);
+
+    // Send real-time update to renderer
+    mainWindow?.webContents.send('peer:offline', {
+      peerId: peer.destination || peer.b32Address,
+      b32Address: peer.b32Address,
+      displayName: peer.displayName || 'Unknown'
+    });
+  });
+
+  // Handle incoming messages for TrackerClient
+  i2pConnection.on('message', ({ from, message }: { from: string; message: any }) => {
+    // Try TrackerClient first
+    if (trackerClient.handleMessage(from, message)) {
+      return; // Handled by TrackerClient
+    }
+    // Otherwise it's a DHT message (already handled by DHT)
+  });
+
+  // Connect to configured trackers
+  if (allTrackers.length > 0) {
+    console.log(`[Main] Bootstrapping DHT via ${allTrackers.length} tracker(s)...`);
+    trackerClient.setTrackerAddresses(allTrackers);
+
+    try {
+      await trackerClient.connect();
+      console.log('[Main] TrackerClient connected - waiting for DHT nodes...');
+
+      // Announce the tracker to DHT so others can discover it
+      const activeTracker = trackerClient.getActiveTracker();
+      if (activeTracker) {
+        announceTrackerToDHT(activeTracker);
+      }
+    } catch (err: any) {
+      console.error('[Main] TrackerClient connection failed:', err.message);
+    }
+  } else {
+    console.log('[Main] No bootstrap trackers configured - will discover via DHT');
+  }
+
+  // Start periodic tracker discovery via DHT (every 5 minutes)
+  startTrackerDiscovery();
+}
+
+/**
+ * Announce a tracker to the DHT so other peers can discover it
+ */
+async function announceTrackerToDHT(trackerDestination: string): Promise<void> {
+  try {
+    console.log(`[Main] Announcing tracker to DHT for network resilience...`);
+    await dhtSearch.announceTracker(trackerDestination);
+    console.log(`[Main] Tracker announced to DHT successfully`);
+  } catch (err: any) {
+    console.error('[Main] Failed to announce tracker to DHT:', err.message);
+  }
+}
+
+/**
+ * Start periodic tracker discovery via DHT
+ * This enables automatic network healing when trackers go down
+ */
+function startTrackerDiscovery(): void {
+  if (trackerDiscoveryInterval) {
+    clearInterval(trackerDiscoveryInterval);
+  }
+
+  // Discover trackers every 5 minutes
+  const DISCOVERY_INTERVAL = 5 * 60 * 1000;
+
+  // Initial discovery after 30 seconds (give DHT time to bootstrap)
+  setTimeout(() => {
+    discoverAndConnectTrackers();
+  }, 30000);
+
+  // Periodic discovery
+  trackerDiscoveryInterval = setInterval(() => {
+    discoverAndConnectTrackers();
+  }, DISCOVERY_INTERVAL);
+
+  console.log('[Main] Tracker discovery started (every 5 minutes)');
+}
+
+/**
+ * Discover trackers via DHT and auto-connect to new ones
+ */
+async function discoverAndConnectTrackers(): Promise<void> {
+  try {
+    console.log('[Main] Discovering trackers via DHT...');
+    const discoveredTrackers = await dhtSearch.discoverTrackers(15000);
+
+    if (discoveredTrackers.length === 0) {
+      console.log('[Main] No new trackers discovered via DHT');
+      return;
+    }
+
+    // Filter out already known trackers
+    const newTrackers = discoveredTrackers.filter(t => !knownTrackerDestinations.has(t));
+
+    if (newTrackers.length === 0) {
+      console.log(`[Main] All ${discoveredTrackers.length} discovered trackers are already known`);
+      return;
+    }
+
+    console.log(`[Main] Found ${newTrackers.length} new tracker(s) via DHT!`);
+
+    // Add new trackers
+    for (const tracker of newTrackers) {
+      knownTrackerDestinations.add(tracker);
+      trackerClient.addTrackerAddress(tracker);
+      console.log(`[Main] Added new tracker: ${tracker.substring(0, 30)}...`);
+
+      // Also add to TorrentManager if available
+      if (torrentManager) {
+        torrentManager.addTracker(tracker);
+      }
+    }
+
+    // Re-announce to spread tracker info further
+    for (const tracker of newTrackers) {
+      announceTrackerToDHT(tracker).catch(() => {});
+    }
+
+    // Notify UI
+    mainWindow?.webContents.send('trackers:discovered', {
+      count: newTrackers.length,
+      total: knownTrackerDestinations.size
+    });
+  } catch (err: any) {
+    console.error('[Main] Tracker discovery failed:', err.message);
+  }
+}
+
 async function startI2PAndConnect(): Promise<void> {
   console.log('[Main] Starting I2P infrastructure...');
 
@@ -790,6 +1029,9 @@ async function startI2PAndConnect(): Promise<void> {
         await i2pConnection.sendMessage(dest, message);
       });
 
+      // Bootstrap DHT via tracker if we have few nodes
+      await bootstrapDHTViaTracker(result.destination, storedDisplayName);
+
       // Initialize TorrentManager for BitTorrent transfers
       console.log('[Main] Initializing TorrentManager...');
       try {
@@ -815,11 +1057,24 @@ async function startI2PAndConnect(): Promise<void> {
         embeddedTracker.setDHTEngine(dhtSearch);
         await embeddedTracker.start();
 
-        // If embedded tracker started, add it to our trackers
+        // If embedded tracker started, add it to our trackers and announce to DHT
         const destinations = embeddedTracker.getDestinations();
-        if (destinations.peerDiscovery && torrentManager) {
-          torrentManager.addTracker(destinations.peerDiscovery);
-          console.log('[Main] Added embedded tracker to multi-tracker');
+        if (destinations.peerDiscovery) {
+          // Add to local tracker list
+          if (torrentManager) {
+            torrentManager.addTracker(destinations.peerDiscovery);
+            console.log('[Main] Added embedded tracker to multi-tracker');
+          }
+
+          // Add to known trackers
+          knownTrackerDestinations.add(destinations.peerDiscovery);
+
+          // Announce embedded tracker to DHT for network-wide discovery
+          // This allows other peers to find our tracker automatically
+          console.log('[Main] Announcing embedded tracker to DHT...');
+          announceTrackerToDHT(destinations.peerDiscovery).catch(err => {
+            console.log('[Main] Embedded tracker DHT announcement:', err.message);
+          });
         }
       } catch (err: any) {
         console.error('[Main] Failed to start EmbeddedTracker:', err.message);
@@ -905,6 +1160,15 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', async () => {
   console.log('[Main] Shutting down...');
+
+  // Stop tracker discovery
+  if (trackerDiscoveryInterval) {
+    clearInterval(trackerDiscoveryInterval);
+    trackerDiscoveryInterval = null;
+  }
+
+  // Disconnect tracker client
+  await trackerClient.disconnect();
 
   // Shutdown TorrentManager
   if (torrentManager) {

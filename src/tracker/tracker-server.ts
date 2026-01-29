@@ -44,9 +44,15 @@ interface TrackerConfig {
 }
 
 interface TrackerMessage {
-  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG' | 'DISCONNECT';
+  type: 'ANNOUNCE' | 'GET_PEERS' | 'PEERS_LIST' | 'PING' | 'PONG' | 'DISCONNECT' | 'GET_DHT_NODES' | 'DHT_NODES_LIST' | 'PEER_ONLINE' | 'PEER_OFFLINE';
   payload: any;
   timestamp: number;
+}
+
+interface DHTNode {
+  nodeId: string;
+  destination: string;
+  lastSeen: number;
 }
 
 interface StoredKeys {
@@ -75,6 +81,9 @@ export class TrackerServer extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private dbSaveTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts: number = 0;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private static readonly HEARTBEAT_INTERVAL = 30 * 1000; // Check every 30s
+  private static readonly HEARTBEAT_TIMEOUT = 90 * 1000;  // Mark offline after 90s without ping
 
   // BEP3 BitTorrent HTTP Tracker
   private btAnnounceHandler: BTAnnounceHandler | null = null;
@@ -90,8 +99,8 @@ export class TrackerServer extends EventEmitter {
       samPortTCP: config.samPortTCP || 7656,
       samPortUDP: config.samPortUDP || 7655,
       listenPort: config.listenPort || 7670,
-      peerTimeout: config.peerTimeout || 5 * 60 * 1000,
-      cleanupInterval: config.cleanupInterval || 60 * 1000,
+      peerTimeout: config.peerTimeout || 90 * 1000, // 90 seconds - for real-time presence
+      cleanupInterval: config.cleanupInterval || 30 * 1000, // Check every 30 seconds
       dataDir: config.dataDir || './tracker-data',
       maxPeersPerResponse: config.maxPeersPerResponse || 100, // Limit per response for large networks
       httpTrackerPort: config.httpTrackerPort || 7680,
@@ -149,6 +158,16 @@ export class TrackerServer extends EventEmitter {
       )
     `);
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_nonces_created ON used_nonces(createdAt)`);
+
+    // DHT nodes table for bootstrap
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS dht_nodes (
+        nodeId TEXT PRIMARY KEY,
+        destination TEXT NOT NULL,
+        lastSeen INTEGER NOT NULL
+      )
+    `);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_dht_nodes_lastSeen ON dht_nodes(lastSeen)`);
 
     // Save database periodically (every 30 seconds)
     this.dbSaveTimer = setInterval(() => {
@@ -517,6 +536,9 @@ export class TrackerServer extends EventEmitter {
       case 'GET_PEERS':
         this.handleGetPeers(from, signingKey);
         break;
+      case 'GET_DHT_NODES':
+        this.handleGetDHTNodes(from);
+        break;
       case 'PING':
         this.handlePing(from, signingKey);
         break;
@@ -533,6 +555,8 @@ export class TrackerServer extends EventEmitter {
     const result = this.dbRun('DELETE FROM peers WHERE destination = ?', [from]);
     if (result.changes > 0) {
       console.log(`[Tracker] Peer disconnected: ${b32.substring(0, 16)}...`);
+      // Broadcast PEER_OFFLINE to all other connected peers
+      this.broadcastPeerOffline(from, b32);
     }
   }
 
@@ -580,12 +604,36 @@ export class TrackerServer extends EventEmitter {
       if (signingKey) {
         console.log(`[Tracker]   -> Has verified signing key`);
       }
+
+      // Broadcast PEER_ONLINE to all other connected peers
+      this.broadcastPeerOnline({
+        destination: from,
+        b32Address: b32,
+        displayName: payload.displayName || 'Unknown',
+        filesCount: payload.filesCount || 0,
+        totalSize: payload.totalSize || 0,
+        lastSeen: Date.now(),
+        streamingDestination: payload.streamingDestination
+      });
     } else {
       console.log(`[Tracker] Peer update: ${b32.substring(0, 16)}... (${payload.filesCount || 0} files)`);
     }
 
-    // Send back the current peer list
+    // Store as DHT node if nodeId is provided (for DHT bootstrap)
+    if (payload.nodeId) {
+      this.dbRun(`
+        INSERT INTO dht_nodes (nodeId, destination, lastSeen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(nodeId) DO UPDATE SET
+          destination = excluded.destination,
+          lastSeen = excluded.lastSeen
+      `, [payload.nodeId, from, Date.now()]);
+      console.log(`[Tracker]   -> DHT node registered: ${payload.nodeId.substring(0, 16)}...`);
+    }
+
+    // Send back the current peer list AND DHT nodes for bootstrap
     this.sendPeersList(from);
+    this.sendDHTNodesList(from);
   }
 
   private handleGetPeers(from: string, signingKey?: string): void {
@@ -621,6 +669,58 @@ export class TrackerServer extends EventEmitter {
       payload: {},
       timestamp: Date.now()
     });
+  }
+
+  /**
+   * Handle GET_DHT_NODES request - returns known DHT nodes for bootstrap
+   */
+  private handleGetDHTNodes(from: string): void {
+    const b32 = toB32(from);
+    console.log(`[Tracker] DHT nodes requested by ${b32.substring(0, 16)}...`);
+    this.sendDHTNodesList(from);
+  }
+
+  /**
+   * Send list of known DHT nodes to a peer for bootstrap
+   */
+  private sendDHTNodesList(to: string): void {
+    // Get active DHT nodes (exclude requester, limit for bandwidth)
+    const cutoff = Date.now() - this.config.peerTimeout;
+    const nodesList = this.dbQuery(`
+      SELECT nodeId, destination
+      FROM dht_nodes
+      WHERE destination != ? AND lastSeen > ?
+      ORDER BY lastSeen DESC
+      LIMIT 50
+    `, [to, cutoff]) as DHTNode[];
+
+    if (nodesList.length === 0) {
+      // If no DHT nodes yet, use peers as fallback
+      const peersList = this.dbQuery(`
+        SELECT destination
+        FROM peers
+        WHERE destination != ? AND lastSeen > ?
+        ORDER BY RANDOM()
+        LIMIT 50
+      `, [to, cutoff]);
+
+      // Create pseudo DHT nodes from peers (they can be contacted for DHT)
+      for (const peer of peersList) {
+        nodesList.push({
+          nodeId: '', // Will be filled by the peer itself
+          destination: peer.destination as string,
+          lastSeen: Date.now()
+        });
+      }
+    }
+
+    this.sendMessage(to, {
+      type: 'DHT_NODES_LIST',
+      payload: { nodes: nodesList },
+      timestamp: Date.now()
+    });
+
+    console.log(`[Tracker] Sent ${nodesList.length} DHT nodes to ${toB32(to).substring(0, 16)}...`);
   }
 
   private sendPeersList(to: string): void {
@@ -676,12 +776,84 @@ export class TrackerServer extends EventEmitter {
     }
   }
 
+  /**
+   * Broadcast a message to all active peers except one (usually the sender)
+   */
+  private broadcastToAllPeers(message: TrackerMessage, exceptDestination?: string): void {
+    const cutoff = Date.now() - this.config.peerTimeout;
+    const activePeers = this.dbQuery(`
+      SELECT destination FROM peers WHERE lastSeen > ?
+    `, [cutoff]) as { destination: string }[];
+
+    let sentCount = 0;
+    for (const peer of activePeers) {
+      if (peer.destination !== exceptDestination) {
+        this.sendMessage(peer.destination, message);
+        sentCount++;
+      }
+    }
+
+    if (sentCount > 0) {
+      console.log(`[Tracker] Broadcast ${message.type} to ${sentCount} peers`);
+    }
+  }
+
+  /**
+   * Notify all peers that a new peer is online
+   */
+  private broadcastPeerOnline(peer: Peer): void {
+    this.broadcastToAllPeers({
+      type: 'PEER_ONLINE',
+      payload: {
+        destination: peer.destination,
+        b32Address: peer.b32Address,
+        displayName: peer.displayName,
+        filesCount: peer.filesCount,
+        totalSize: peer.totalSize,
+        streamingDestination: peer.streamingDestination
+      },
+      timestamp: Date.now()
+    }, peer.destination);
+  }
+
+  /**
+   * Notify all peers that a peer went offline
+   */
+  private broadcastPeerOffline(destination: string, b32Address: string): void {
+    this.broadcastToAllPeers({
+      type: 'PEER_OFFLINE',
+      payload: {
+        destination,
+        b32Address
+      },
+      timestamp: Date.now()
+    });
+  }
+
   private cleanupInactivePeers(): void {
     const cutoff = Date.now() - this.config.peerTimeout;
+
+    // First, get the peers that will be removed (to broadcast PEER_OFFLINE)
+    const stalePeers = this.dbQuery(`
+      SELECT destination, b32Address FROM peers WHERE lastSeen < ?
+    `, [cutoff]) as { destination: string; b32Address: string }[];
+
+    // Delete inactive peers
     const result = this.dbRun('DELETE FROM peers WHERE lastSeen < ?', [cutoff]);
 
     if (result.changes > 0) {
       console.log(`[Tracker] Cleanup: removed ${result.changes} inactive peers`);
+
+      // Broadcast PEER_OFFLINE for each removed peer
+      for (const stalePeer of stalePeers) {
+        this.broadcastPeerOffline(stalePeer.destination, stalePeer.b32Address);
+      }
+    }
+
+    // Also cleanup inactive DHT nodes
+    const dhtResult = this.dbRun('DELETE FROM dht_nodes WHERE lastSeen < ?', [cutoff]);
+    if (dhtResult.changes > 0) {
+      console.log(`[Tracker] Cleanup: removed ${dhtResult.changes} inactive DHT nodes`);
     }
   }
 
