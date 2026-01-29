@@ -1115,6 +1115,19 @@ async function startI2PAndConnect(): Promise<void> {
           // Add to known trackers
           knownTrackerDestinations.add(destinations.peerDiscovery);
 
+          // Register ourselves as a peer in our own tracker
+          // This way when other peers connect, they can discover us
+          const storedDisplayName = store.get('displayName', 'I2P Share User') as string;
+          embeddedTracker.registerLocalPeer({
+            destination: result.destination,
+            b32Address: result.b32Address,
+            displayName: storedDisplayName,
+            filesCount: 0, // Will be updated later
+            totalSize: 0,
+            nodeId: dhtSearch.getNodeId()
+          });
+          console.log('[Main] Registered local host in embedded tracker');
+
           // IMPORTANT: Also connect TrackerClient to our own embedded tracker
           // This way we receive peer updates when others connect to our tracker
           trackerClient.addTrackerAddress(destinations.peerDiscovery);
@@ -1134,6 +1147,45 @@ async function startI2PAndConnect(): Promise<void> {
             console.log('[Main] Embedded tracker DHT announcement:', err.message);
           });
         }
+
+        // Listen for peer events from embedded tracker (local notifications)
+        // This handles peers connecting to our tracker without going through I2P
+        embeddedTracker.on('peer:connected', (peer: any) => {
+          console.log(`[Main] Embedded tracker: peer connected - ${peer.displayName || peer.b32Address?.substring(0, 16)}`);
+
+          // Save to database
+          const now = Math.floor(Date.now() / 1000);
+          PeerOps.upsert({
+            peerId: peer.b32Address || peer.destination,
+            displayName: peer.displayName || 'Unknown',
+            filesCount: peer.filesCount || 0,
+            totalSize: peer.totalSize || 0
+          });
+
+          // Notify UI
+          mainWindow?.webContents.send('peer:online', {
+            peerId: peer.b32Address || peer.destination,
+            b32Address: peer.b32Address,
+            displayName: peer.displayName || 'Unknown',
+            filesCount: peer.filesCount || 0,
+            totalSize: peer.totalSize || 0,
+            streamingDestination: peer.streamingDestination
+          });
+
+          // Also trigger a peers refresh
+          mainWindow?.webContents.send('peers:updated', { count: 1 });
+        });
+
+        embeddedTracker.on('peer:updated', (peer: any) => {
+          // Update peer in database
+          PeerOps.upsert({
+            peerId: peer.b32Address || peer.destination,
+            displayName: peer.displayName || 'Unknown',
+            filesCount: peer.filesCount || 0,
+            totalSize: peer.totalSize || 0
+          });
+        });
+
       } catch (err: any) {
         console.error('[Main] Failed to start EmbeddedTracker:', err.message);
       }

@@ -596,6 +596,16 @@ export class TrackerServer extends EventEmitter {
       signingKey || null
     ]);
 
+    const peerData = {
+      destination: from,
+      b32Address: b32,
+      displayName: payload.displayName || 'Unknown',
+      filesCount: payload.filesCount || 0,
+      totalSize: payload.totalSize || 0,
+      lastSeen: Date.now(),
+      streamingDestination: payload.streamingDestination
+    };
+
     if (isNew) {
       console.log(`[Tracker] New peer: ${b32.substring(0, 16)}... (${payload.displayName || 'Unknown'})`);
       if (payload.streamingDestination) {
@@ -606,17 +616,14 @@ export class TrackerServer extends EventEmitter {
       }
 
       // Broadcast PEER_ONLINE to all other connected peers
-      this.broadcastPeerOnline({
-        destination: from,
-        b32Address: b32,
-        displayName: payload.displayName || 'Unknown',
-        filesCount: payload.filesCount || 0,
-        totalSize: payload.totalSize || 0,
-        lastSeen: Date.now(),
-        streamingDestination: payload.streamingDestination
-      });
+      this.broadcastPeerOnline(peerData);
+
+      // Emit local event for embedded tracker to notify main process
+      this.emit('peer:connected', peerData);
     } else {
       console.log(`[Tracker] Peer update: ${b32.substring(0, 16)}... (${payload.filesCount || 0} files)`);
+      // Also emit update event for existing peers
+      this.emit('peer:updated', peerData);
     }
 
     // Store as DHT node if nodeId is provided (for DHT bootstrap)
@@ -889,6 +896,56 @@ export class TrackerServer extends EventEmitter {
 
   getDestination(): string {
     return this.destination;
+  }
+
+  /**
+   * Register the local host as a peer in the tracker (without going through I2P)
+   * This allows other peers connecting to this tracker to discover the host
+   */
+  registerLocalPeer(peer: {
+    destination: string;
+    b32Address: string;
+    displayName: string;
+    filesCount?: number;
+    totalSize?: number;
+    streamingDestination?: string;
+    nodeId?: string;
+  }): void {
+    if (!this.db) return;
+
+    console.log(`[Tracker] Registering local host as peer: ${peer.b32Address.substring(0, 16)}...`);
+
+    this.dbRun(`
+      INSERT INTO peers (destination, b32Address, displayName, filesCount, totalSize, lastSeen, streamingDestination)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(destination) DO UPDATE SET
+        displayName = excluded.displayName,
+        filesCount = excluded.filesCount,
+        totalSize = excluded.totalSize,
+        lastSeen = excluded.lastSeen,
+        streamingDestination = excluded.streamingDestination
+    `, [
+      peer.destination,
+      peer.b32Address,
+      peer.displayName,
+      peer.filesCount || 0,
+      peer.totalSize || 0,
+      Date.now(),
+      peer.streamingDestination || null
+    ]);
+
+    // Also register as DHT node if nodeId provided
+    if (peer.nodeId) {
+      this.dbRun(`
+        INSERT INTO dht_nodes (nodeId, destination, lastSeen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(nodeId) DO UPDATE SET
+          destination = excluded.destination,
+          lastSeen = excluded.lastSeen
+      `, [peer.nodeId, peer.destination, Date.now()]);
+    }
+
+    console.log(`[Tracker] Local host registered successfully`);
   }
 
   async stop(): Promise<void> {

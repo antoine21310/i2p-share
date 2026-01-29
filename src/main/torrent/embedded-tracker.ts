@@ -150,6 +150,16 @@ export class EmbeddedTracker extends EventEmitter {
         enableBTTracker: true
       });
 
+      // Forward tracker events to allow main process to handle peer notifications
+      this.tracker.on('peer:connected', (peer: any) => {
+        console.log(`[EmbeddedTracker] Peer connected: ${peer.b32Address?.substring(0, 16)}...`);
+        this.emit('peer:connected', peer);
+      });
+
+      this.tracker.on('peer:updated', (peer: any) => {
+        this.emit('peer:updated', peer);
+      });
+
       // Start the tracker
       const result = await this.tracker.start();
 
@@ -369,6 +379,24 @@ export class EmbeddedTracker extends EventEmitter {
       peerDiscoveryB32: this.state.b32Address,
       btTrackerB32: this.state.btTrackerB32
     };
+  }
+
+  /**
+   * Register the local host as a peer in the tracker
+   * This allows other peers to discover the host when they connect to this tracker
+   */
+  registerLocalPeer(peer: {
+    destination: string;
+    b32Address: string;
+    displayName: string;
+    filesCount?: number;
+    totalSize?: number;
+    streamingDestination?: string;
+    nodeId?: string;
+  }): void {
+    if (this.tracker) {
+      this.tracker.registerLocalPeer(peer);
+    }
   }
 
   /**
