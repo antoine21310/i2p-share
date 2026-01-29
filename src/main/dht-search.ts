@@ -293,10 +293,12 @@ export class DHTSearchEngine extends EventEmitter {
       if (this.messageHandler) {
         this.messageHandler(node.destination, message);
       }
+      // Note: Do NOT delete from pending here - we need to wait for response
+      // pending will be cleared in handleSearchResponse or by timeout
     } catch (error) {
       console.error(`[DHT] Error sending to ${node.nodeId}:`, error);
       RoutingOps.incrementFail(node.nodeId);
-    } finally {
+      // Only remove from pending on error
       context.pending.delete(node.nodeId);
     }
   }
@@ -341,12 +343,19 @@ export class DHTSearchEngine extends EventEmitter {
     // Emit response event for anyone waiting (e.g. getPeers, search)
     this.emit('message:response', message);
 
+    // Handle FIND_VALUE responses (search results)
+    if (message.type === 'FIND_VALUE' && message.payload.searchId) {
+      const { searchId, results, closerNodes } = message.payload;
+      console.log(`[DHT] Received search response for ${searchId}: ${results?.length || 0} results from ${message.nodeId?.substring(0, 16)}...`);
+      this.handleSearchResponse(searchId, results || [], closerNodes || [], message.nodeId);
+    }
+
     // If it's a GET_PEERS response, cache the token
     if (message.type === 'GET_PEERS' && message.payload.token) {
       // Store token associated with the node's ID
       this.tokenCache.set(message.nodeId, message.payload.token);
       // Also store by destination just in case
-      this.tokenCache.set(from, message.payload.token); 
+      this.tokenCache.set(from, message.payload.token);
     }
   }
 
@@ -433,9 +442,14 @@ export class DHTSearchEngine extends EventEmitter {
   }
 
   // Handle search response
-  handleSearchResponse(searchId: string, results: SearchResult[], closerNodes: any[]): void {
+  handleSearchResponse(searchId: string, results: SearchResult[], closerNodes: any[], responderNodeId?: string): void {
     const context = this.activeSearches.get(searchId);
     if (!context) return;
+
+    // Remove responder from pending
+    if (responderNodeId) {
+      context.pending.delete(responderNodeId);
+    }
 
     // Add results
     for (const result of results) {
@@ -459,7 +473,7 @@ export class DHTSearchEngine extends EventEmitter {
       }
     }
 
-    // Check if search is complete
+    // Check if search is complete (all pending responded or we have results)
     if (context.pending.size === 0) {
       this.finalizeSearch(searchId);
     }

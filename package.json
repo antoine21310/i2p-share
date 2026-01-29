@@ -2,6 +2,7 @@
   "name": "i2p-share",
   "version": "1.0.0",
   "description": "Anonymous decentralized file sharing over I2P",
+  "type": "module",
   "main": "dist/main/bootstrap.cjs",
   "scripts": {
     "dev": "npm run build:main && concurrently \"npm run dev:main\" \"npm run dev:renderer\" \"npm run dev:electron\"",
@@ -17,7 +18,9 @@
     "postinstall": "electron-rebuild -f -w better-sqlite3",
     "build:tracker": "tsc -p tsconfig.tracker.json",
     "tracker": "npm run build:tracker && node dist/tracker/tracker/index.js",
-    "tracker:dev": "tsc -p tsconfig.tracker.json && node dist/tracker/tracker/index.js"
+    "tracker:dev": "tsc -p tsconfig.tracker.json && node dist/tracker/tracker/index.js",
+    "build:test-cli": "tsc -p tsconfig.test-cli.json",
+    "test:cli": "npm run build:test-cli && node dist/test-cli/test-cli/index.js"
   },
   "dependencies": {
     "@diva.exchange/i2p-sam": "^5.5.2",

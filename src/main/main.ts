@@ -149,6 +149,20 @@ function setupIPC(): void {
     if (i2pConnection.isReady()) {
       try {
         dhtResults = await dhtSearch.search(query, filters, 10000);
+
+        // Save remote results to database for later retrieval
+        for (const result of dhtResults) {
+          if (result.peerId && result.peerId !== 'local') {
+            RemoteFileOps.upsert({
+              peerId: result.peerId,
+              filename: result.filename,
+              hash: result.fileHash,
+              size: result.size,
+              mimeType: result.mimeType
+            });
+          }
+        }
+        console.log(`[IPC] Saved ${dhtResults.length} remote files to database`);
       } catch (e) {
         console.log('[IPC] DHT search error:', e);
       }
@@ -993,9 +1007,15 @@ async function bootstrapDHTViaTracker(destination: string, displayName: string):
     mainWindow?.webContents.send('peers:updated', { count: peers.length });
 
     // Peers can be used as DHT nodes too
+    // Generate nodeId from b32Address or destination hash for proper DHT routing
     const peerNodes = peers
       .filter(p => p.destination && p.destination.length > 50)
-      .map(p => ({ nodeId: '', destination: p.destination }));
+      .map(p => ({
+        // Use b32Address (if available) as nodeId since it's unique per destination
+        // Otherwise use first 40 chars of destination as pseudo-nodeId
+        nodeId: p.b32Address?.replace('.b32.i2p', '') || p.destination.substring(0, 40),
+        destination: p.destination
+      }));
 
     if (peerNodes.length > 0) {
       dhtSearch.bootstrap(peerNodes).catch(err => {
@@ -1060,6 +1080,12 @@ async function bootstrapDHTViaTracker(destination: string, displayName: string):
   if (allTrackers.length > 0) {
     console.log(`[Main] Bootstrapping DHT via ${allTrackers.length} tracker(s)...`);
     trackerClient.setTrackerAddresses(allTrackers);
+
+    // Update stats with existing files BEFORE connecting to tracker
+    const existingFiles = fileIndexer.getAllFiles();
+    const existingTotalSize = existingFiles.reduce((sum, f) => sum + (f.size || 0), 0);
+    trackerClient.updateStats(existingFiles.length, existingTotalSize);
+    console.log(`[Main] Updated TrackerClient stats: ${existingFiles.length} files, ${existingTotalSize} bytes`);
 
     try {
       await trackerClient.connect();
@@ -1247,15 +1273,17 @@ async function startI2PAndConnect(): Promise<void> {
           // Register ourselves as a peer in our own tracker
           // This way when other peers connect, they can discover us
           const storedDisplayName = store.get('displayName', 'I2P Share User') as string;
+          const localFiles = fileIndexer.getAllFiles();
+          const localTotalSize = localFiles.reduce((sum, f) => sum + (f.size || 0), 0);
           embeddedTracker.registerLocalPeer({
             destination: result.destination,
             b32Address: result.b32Address,
             displayName: storedDisplayName,
-            filesCount: 0, // Will be updated later
-            totalSize: 0,
+            filesCount: localFiles.length,
+            totalSize: localTotalSize,
             nodeId: dhtSearch.getNodeId()
           });
-          console.log('[Main] Registered local host in embedded tracker');
+          console.log(`[Main] Registered local host in embedded tracker (${localFiles.length} files)`);
 
           // IMPORTANT: Also connect TrackerClient to our own embedded tracker
           // This way we receive peer updates when others connect to our tracker
