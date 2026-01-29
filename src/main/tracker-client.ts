@@ -69,6 +69,7 @@ export class TrackerClient extends EventEmitter {
   private signingKeys: SigningKeypair | null = null;
   private usedNonces: Set<string> = new Set(); // Replay attack protection
   private nodeId: string = ''; // DHT node ID for bootstrap
+  private userConfiguredTrackers: Set<string> = new Set(); // Trackers explicitly set by user (priority)
 
   constructor(config: Partial<TrackerClientConfig> = {}) {
     super();
@@ -126,10 +127,27 @@ export class TrackerClient extends EventEmitter {
     return this.signingKeys?.publicKey || null;
   }
 
-  // Set tracker addresses (replaces the list)
-  setTrackerAddresses(addresses: string[]): void {
-    this.config.trackerAddresses = addresses.filter(a => a && a.trim().length > 0);
-    console.log(`[TrackerClient] Set ${this.config.trackerAddresses.length} tracker(s)`);
+  // Set tracker addresses (replaces the list) - these are user-configured and have priority
+  setTrackerAddresses(addresses: string[], isUserConfigured: boolean = true): void {
+    const filtered = addresses.filter(a => a && a.trim().length > 0);
+
+    if (isUserConfigured) {
+      // User-configured trackers: replace the user set and put them at the front
+      this.userConfiguredTrackers.clear();
+      for (const addr of filtered) {
+        this.userConfiguredTrackers.add(addr);
+      }
+
+      // Remove user trackers from current list, then prepend them
+      const nonUserTrackers = this.config.trackerAddresses.filter(
+        a => !this.userConfiguredTrackers.has(a)
+      );
+      this.config.trackerAddresses = [...filtered, ...nonUserTrackers];
+    } else {
+      this.config.trackerAddresses = filtered;
+    }
+
+    console.log(`[TrackerClient] Set ${filtered.length} tracker(s) (user-configured: ${isUserConfigured})`);
 
     // Reset state
     this.activeTrackerIndex = -1;
@@ -137,10 +155,19 @@ export class TrackerClient extends EventEmitter {
   }
 
   // Add a single tracker address
-  addTrackerAddress(address: string): void {
+  // isUserConfigured: if true, this tracker has priority over embedded/discovered trackers
+  addTrackerAddress(address: string, isUserConfigured: boolean = false): void {
     if (address && !this.config.trackerAddresses.includes(address)) {
-      this.config.trackerAddresses.push(address);
-      console.log(`[TrackerClient] Added tracker: ${address.substring(0, 20)}...`);
+      if (isUserConfigured) {
+        // User-configured: add to priority set and prepend to list
+        this.userConfiguredTrackers.add(address);
+        this.config.trackerAddresses.unshift(address);
+        console.log(`[TrackerClient] Added user tracker (priority): ${address.substring(0, 20)}...`);
+      } else {
+        // Non-user (embedded/discovered): add to end of list
+        this.config.trackerAddresses.push(address);
+        console.log(`[TrackerClient] Added tracker: ${address.substring(0, 20)}...`);
+      }
     }
   }
 
@@ -201,24 +228,38 @@ export class TrackerClient extends EventEmitter {
     this.totalSize = totalSize;
   }
 
-  // Select a random tracker from available ones
-  private selectRandomTracker(): number {
+  // Select a tracker with priority for user-configured trackers
+  private selectPriorityTracker(): number {
     const available = this.config.trackerAddresses
-      .map((_, i) => i)
-      .filter(i => !this.failedTrackers.has(i));
+      .map((addr, i) => ({ addr, i }))
+      .filter(({ i }) => !this.failedTrackers.has(i));
 
     if (available.length === 0) {
       // All trackers failed, reset and try again
       console.log('[TrackerClient] All trackers failed, resetting...');
       this.failedTrackers.clear();
-      return this.config.trackerAddresses.length > 0
-        ? Math.floor(Math.random() * this.config.trackerAddresses.length)
-        : -1;
+
+      // After reset, try to find a user-configured tracker first
+      const userTracker = this.config.trackerAddresses.findIndex(
+        addr => this.userConfiguredTrackers.has(addr)
+      );
+      if (userTracker >= 0) {
+        return userTracker;
+      }
+      return this.config.trackerAddresses.length > 0 ? 0 : -1;
     }
 
-    // Random selection from available
-    const randomIndex = Math.floor(Math.random() * available.length);
-    return available[randomIndex];
+    // Priority 1: User-configured trackers
+    const userAvailable = available.filter(({ addr }) => this.userConfiguredTrackers.has(addr));
+    if (userAvailable.length > 0) {
+      // Return the first available user-configured tracker
+      console.log(`[TrackerClient] Using user-configured tracker (priority)`);
+      return userAvailable[0].i;
+    }
+
+    // Priority 2: Other trackers (embedded/discovered)
+    console.log(`[TrackerClient] No user trackers available, using embedded/discovered tracker`);
+    return available[0].i;
   }
 
   async connect(): Promise<boolean> {
@@ -238,7 +279,7 @@ export class TrackerClient extends EventEmitter {
     }
 
     // Select a random tracker
-    this.activeTrackerIndex = this.selectRandomTracker();
+    this.activeTrackerIndex = this.selectPriorityTracker();
 
     if (this.activeTrackerIndex < 0) {
       console.log('[TrackerClient] No trackers available');
@@ -338,7 +379,7 @@ export class TrackerClient extends EventEmitter {
   // Switch to a different tracker
   private async switchTracker(): Promise<void> {
     const oldTracker = this.activeTrackerIndex;
-    this.activeTrackerIndex = this.selectRandomTracker();
+    this.activeTrackerIndex = this.selectPriorityTracker();
 
     if (this.activeTrackerIndex < 0 || this.activeTrackerIndex === oldTracker) {
       console.log('[TrackerClient] No alternative trackers available');
@@ -346,7 +387,7 @@ export class TrackerClient extends EventEmitter {
       if (this.config.trackerAddresses.length > 0) {
         console.log('[TrackerClient] Clearing failed tracker list for retry');
         this.failedTrackers.clear();
-        this.activeTrackerIndex = this.selectRandomTracker();
+        this.activeTrackerIndex = this.selectPriorityTracker();
       }
       return;
     }

@@ -646,9 +646,9 @@ function setupIPC(): void {
     if (addresses.length > 0 && i2pConnection.isReady()) {
       console.log(`[Main] Updating TrackerClient with ${addresses.length} tracker(s)...`);
 
-      // Add new addresses to TrackerClient
+      // Add new addresses to TrackerClient (user-configured = priority)
       for (const addr of addresses) {
-        trackerClient.addTrackerAddress(addr);
+        trackerClient.addTrackerAddress(addr, true); // true = user-configured, has priority
         knownTrackerDestinations.add(addr);
       }
 
@@ -1076,10 +1076,10 @@ async function bootstrapDHTViaTracker(destination: string, displayName: string):
     // Otherwise it's a DHT message (already handled by DHT)
   });
 
-  // Connect to configured trackers
+  // Connect to configured trackers (user-configured = priority)
   if (allTrackers.length > 0) {
     console.log(`[Main] Bootstrapping DHT via ${allTrackers.length} tracker(s)...`);
-    trackerClient.setTrackerAddresses(allTrackers);
+    trackerClient.setTrackerAddresses(allTrackers, true); // true = user-configured, has priority
 
     // Update stats with existing files BEFORE connecting to tracker
     const existingFiles = fileIndexer.getAllFiles();
