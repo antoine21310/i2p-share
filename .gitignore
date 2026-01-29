@@ -42,4 +42,4 @@ npm-debug.log*
 # Part files (downloads in progress)
 *.part
 .claude
-tracker-data/i2pd
+tracker-data
