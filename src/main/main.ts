@@ -1186,6 +1186,37 @@ async function startI2PAndConnect(): Promise<void> {
           });
         });
 
+        // Periodically sync peers from embedded tracker to application database
+        // This ensures the UI shows peers connected to our tracker
+        const syncTrackerPeers = () => {
+          if (!embeddedTracker) return;
+
+          const trackerPeers = embeddedTracker.getActivePeers();
+          const myB32 = result.b32Address;
+
+          for (const peer of trackerPeers) {
+            // Skip ourselves
+            if (peer.b32Address === myB32) continue;
+
+            // Save to application database
+            PeerOps.upsert({
+              peerId: peer.b32Address || peer.destination,
+              displayName: peer.displayName || 'Unknown',
+              filesCount: peer.filesCount || 0,
+              totalSize: peer.totalSize || 0
+            });
+          }
+
+          if (trackerPeers.length > 1) { // More than just ourselves
+            console.log(`[Main] Synced ${trackerPeers.length - 1} peer(s) from embedded tracker`);
+            mainWindow?.webContents.send('peers:updated', { count: trackerPeers.length - 1 });
+          }
+        };
+
+        // Sync immediately and then every 10 seconds
+        syncTrackerPeers();
+        setInterval(syncTrackerPeers, 10000);
+
       } catch (err: any) {
         console.error('[Main] Failed to start EmbeddedTracker:', err.message);
       }

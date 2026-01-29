@@ -400,6 +400,25 @@ export class EmbeddedTracker extends EventEmitter {
   }
 
   /**
+   * Get all active peers from the tracker
+   * Used for synchronizing tracker peers to the main application database
+   */
+  getActivePeers(): Array<{
+    destination: string;
+    b32Address: string;
+    displayName: string;
+    filesCount: number;
+    totalSize: number;
+    streamingDestination?: string;
+    lastSeen: number;
+  }> {
+    if (this.tracker) {
+      return this.tracker.getActivePeers();
+    }
+    return [];
+  }
+
+  /**
    * Check if tracker is running
    */
   isRunning(): boolean {

@@ -899,6 +899,32 @@ export class TrackerServer extends EventEmitter {
   }
 
   /**
+   * Get all active peers from the tracker database
+   * Used for synchronizing peers to the main application
+   */
+  getActivePeers(): Array<{
+    destination: string;
+    b32Address: string;
+    displayName: string;
+    filesCount: number;
+    totalSize: number;
+    streamingDestination?: string;
+    lastSeen: number;
+  }> {
+    if (!this.db) return [];
+
+    const cutoff = Date.now() - this.config.peerTimeout;
+    const peers = this.dbQuery(`
+      SELECT destination, b32Address, displayName, filesCount, totalSize, streamingDestination, lastSeen
+      FROM peers
+      WHERE lastSeen > ?
+      ORDER BY lastSeen DESC
+    `, [cutoff]);
+
+    return peers as any[];
+  }
+
+  /**
    * Register the local host as a peer in the tracker (without going through I2P)
    * This allows other peers connecting to this tracker to discover the host
    */
