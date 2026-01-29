@@ -13,6 +13,29 @@ function copySqlWasm() {
   console.log('Copied sql-wasm.wasm to dist/main');
 }
 
+// Create bootstrap.cjs - CJS entry point that loads ESM main module
+function createBootstrap() {
+  const bootstrapContent = `/**
+ * Bootstrap loader for Electron ESM main process
+ * This CJS file is the actual entry point that Electron loads,
+ * which then dynamically imports the ESM main module.
+ */
+
+const electron = require('electron');
+
+// Expose electron as a global so ESM modules can access it
+globalThis.__electron = electron;
+
+// Dynamic import of ESM main module
+import('./main.mjs').catch(error => {
+  console.error('Failed to load main module:', error);
+  electron.app.quit();
+});
+`;
+  fs.writeFileSync('dist/main/bootstrap.cjs', bootstrapContent);
+  console.log('Created bootstrap.cjs');
+}
+
 const buildOptions = {
   entryPoints: ['src/main/main.ts'],
   bundle: true,
@@ -56,8 +79,9 @@ const preloadBuildOptions = {
 
 async function build() {
   try {
-    // Copy WASM file before building
+    // Copy WASM file and create bootstrap before building
     copySqlWasm();
+    createBootstrap();
 
     if (isWatch) {
       const mainCtx = await esbuild.context(buildOptions);
