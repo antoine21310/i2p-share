@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { createRaw, createLocalDestination, toB32 } from '@diva.exchange/i2p-sam';
-import Database from 'better-sqlite3';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -50,7 +50,8 @@ interface StoredKeys {
 export class TrackerServer extends EventEmitter {
   private config: TrackerConfig;
   private sam: any = null;
-  private db: Database.Database | null = null;
+  private db: SqlJsDatabase | null = null;
+  private dbPath: string = '';
   private destination: string = '';
   private b32Address: string = '';
   private publicKey: string = '';
@@ -62,16 +63,8 @@ export class TrackerServer extends EventEmitter {
   private cleanupTimer: NodeJS.Timeout | null = null;
   private statsInterval: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private dbSaveTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts: number = 0;
-
-  // Prepared statements for efficient queries
-  private stmtUpsertPeer: Database.Statement | null = null;
-  private stmtGetPeer: Database.Statement | null = null;
-  private stmtDeletePeer: Database.Statement | null = null;
-  private stmtGetActivePeers: Database.Statement | null = null;
-  private stmtGetPeerCount: Database.Statement | null = null;
-  private stmtCleanupPeers: Database.Statement | null = null;
-  private stmtUpdateLastSeen: Database.Statement | null = null;
 
   constructor(config: Partial<TrackerConfig> = {}) {
     super();
@@ -88,26 +81,32 @@ export class TrackerServer extends EventEmitter {
   }
 
   /**
-   * Initialize SQLite database for peer storage
+   * Initialize SQLite database for peer storage using sql.js (pure JS)
    * Optimized for 100k+ peers with proper indexing
    */
-  private initDatabase(): void {
-    const dbPath = path.join(this.config.dataDir, 'tracker.db');
+  private async initDatabase(): Promise<void> {
+    this.dbPath = path.join(this.config.dataDir, 'tracker.db');
 
     // Ensure directory exists
     if (!fs.existsSync(this.config.dataDir)) {
       fs.mkdirSync(this.config.dataDir, { recursive: true });
     }
 
-    this.db = new Database(dbPath);
+    // Initialize sql.js
+    const SQL = await initSqlJs();
 
-    // Enable WAL mode for better concurrent performance
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
-    this.db.pragma('cache_size = -64000'); // 64MB cache
+    // Load existing database or create new one
+    if (fs.existsSync(this.dbPath)) {
+      const fileBuffer = fs.readFileSync(this.dbPath);
+      this.db = new SQL.Database(fileBuffer);
+      console.log('[Tracker] Loaded existing database from:', this.dbPath);
+    } else {
+      this.db = new SQL.Database();
+      console.log('[Tracker] Created new database');
+    }
 
     // Create peers table with proper indexing
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS peers (
         destination TEXT PRIMARY KEY,
         b32Address TEXT NOT NULL,
@@ -117,85 +116,98 @@ export class TrackerServer extends EventEmitter {
         lastSeen INTEGER NOT NULL,
         streamingDestination TEXT,
         signingKey TEXT
-      );
+      )
+    `);
 
-      -- Index for efficient cleanup queries
-      CREATE INDEX IF NOT EXISTS idx_peers_lastSeen ON peers(lastSeen);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_peers_lastSeen ON peers(lastSeen)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_peers_b32 ON peers(b32Address)`);
 
-      -- Index for b32 lookups
-      CREATE INDEX IF NOT EXISTS idx_peers_b32 ON peers(b32Address);
-
-      -- Used nonces table for replay protection (with auto-cleanup)
+    // Used nonces table for replay protection
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS used_nonces (
         nonce TEXT PRIMARY KEY,
         createdAt INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_nonces_created ON used_nonces(createdAt);
+      )
     `);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_nonces_created ON used_nonces(createdAt)`);
 
-    // Prepare statements for efficient repeated queries
-    this.stmtUpsertPeer = this.db.prepare(`
-      INSERT INTO peers (destination, b32Address, displayName, filesCount, totalSize, lastSeen, streamingDestination, signingKey)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(destination) DO UPDATE SET
-        displayName = excluded.displayName,
-        filesCount = excluded.filesCount,
-        totalSize = excluded.totalSize,
-        lastSeen = excluded.lastSeen,
-        streamingDestination = excluded.streamingDestination,
-        signingKey = COALESCE(peers.signingKey, excluded.signingKey)
-    `);
+    // Save database periodically (every 30 seconds)
+    this.dbSaveTimer = setInterval(() => {
+      this.saveDatabase();
+    }, 30000);
 
-    this.stmtGetPeer = this.db.prepare('SELECT * FROM peers WHERE destination = ?');
-    this.stmtDeletePeer = this.db.prepare('DELETE FROM peers WHERE destination = ?');
-    this.stmtGetPeerCount = this.db.prepare('SELECT COUNT(*) as count FROM peers WHERE lastSeen > ?');
-    this.stmtCleanupPeers = this.db.prepare('DELETE FROM peers WHERE lastSeen < ?');
-    this.stmtUpdateLastSeen = this.db.prepare('UPDATE peers SET lastSeen = ? WHERE destination = ?');
+    console.log('[Tracker] SQLite database initialized at:', this.dbPath);
+  }
 
-    // For paginated peer list (exclude requester, random order for load distribution)
-    this.stmtGetActivePeers = this.db.prepare(`
-      SELECT destination, b32Address, displayName, filesCount, totalSize, streamingDestination
-      FROM peers
-      WHERE destination != ? AND lastSeen > ?
-      ORDER BY RANDOM()
-      LIMIT ?
-    `);
+  /**
+   * Save database to disk
+   */
+  private saveDatabase(): void {
+    if (!this.db) return;
+    try {
+      const data = this.db.export();
+      const buffer = Buffer.from(data);
+      fs.writeFileSync(this.dbPath, buffer);
+    } catch (e: any) {
+      console.error('[Tracker] Failed to save database:', e.message);
+    }
+  }
 
-    console.log('[Tracker] SQLite database initialized at:', dbPath);
+  /**
+   * Execute a query and get results
+   */
+  private dbQuery(sql: string, params: any[] = []): any[] {
+    if (!this.db) return [];
+    try {
+      const stmt = this.db.prepare(sql);
+      stmt.bind(params);
+      const results: any[] = [];
+      while (stmt.step()) {
+        results.push(stmt.getAsObject());
+      }
+      stmt.free();
+      return results;
+    } catch (e: any) {
+      console.error('[Tracker] Query error:', e.message);
+      return [];
+    }
+  }
+
+  /**
+   * Execute a query without expecting results
+   */
+  private dbRun(sql: string, params: any[] = []): { changes: number } {
+    if (!this.db) return { changes: 0 };
+    try {
+      this.db.run(sql, params);
+      return { changes: this.db.getRowsModified() };
+    } catch (e: any) {
+      console.error('[Tracker] Run error:', e.message);
+      return { changes: 0 };
+    }
   }
 
   /**
    * Check if a nonce has been used (replay attack protection)
    */
   private isNonceUsed(nonce: string): boolean {
-    if (!this.db) return false;
-
-    const row = this.db.prepare('SELECT 1 FROM used_nonces WHERE nonce = ?').get(nonce);
-    return !!row;
+    const rows = this.dbQuery('SELECT 1 FROM used_nonces WHERE nonce = ?', [nonce]);
+    return rows.length > 0;
   }
 
   /**
    * Mark a nonce as used
    */
   private markNonceUsed(nonce: string): void {
-    if (!this.db) return;
-
-    try {
-      this.db.prepare('INSERT OR IGNORE INTO used_nonces (nonce, createdAt) VALUES (?, ?)').run(nonce, Date.now());
-    } catch (e) {
-      // Ignore duplicate errors
-    }
+    this.dbRun('INSERT OR IGNORE INTO used_nonces (nonce, createdAt) VALUES (?, ?)', [nonce, Date.now()]);
   }
 
   /**
    * Clean up old nonces from database
    */
   private cleanupNonces(): void {
-    if (!this.db) return;
-
     const cutoff = Date.now() - (10 * 60 * 1000); // 10 minutes
-    this.db.prepare('DELETE FROM used_nonces WHERE createdAt < ?').run(cutoff);
+    this.dbRun('DELETE FROM used_nonces WHERE createdAt < ?', [cutoff]);
   }
 
   private getKeysPath(): string {
@@ -246,8 +258,8 @@ export class TrackerServer extends EventEmitter {
     console.log('[Tracker] Data directory:', this.config.dataDir);
 
     try {
-      // Initialize SQLite database first
-      this.initDatabase();
+      // Initialize SQLite database first (async for sql.js)
+      await this.initDatabase();
 
       // Try to load existing keys
       const existingKeys = this.loadKeys();
@@ -492,11 +504,9 @@ export class TrackerServer extends EventEmitter {
 
   private handleDisconnect(from: string): void {
     const b32 = toB32(from);
-    if (this.stmtDeletePeer) {
-      const result = this.stmtDeletePeer.run(from);
-      if (result.changes > 0) {
-        console.log(`[Tracker] Peer disconnected: ${b32.substring(0, 16)}...`);
-      }
+    const result = this.dbRun('DELETE FROM peers WHERE destination = ?', [from]);
+    if (result.changes > 0) {
+      console.log(`[Tracker] Peer disconnected: ${b32.substring(0, 16)}...`);
     }
   }
 
@@ -504,7 +514,8 @@ export class TrackerServer extends EventEmitter {
     const b32 = toB32(from);
 
     // Check existing peer
-    const existingPeer = this.stmtGetPeer?.get(from) as Peer | undefined;
+    const existingPeers = this.dbQuery('SELECT * FROM peers WHERE destination = ?', [from]);
+    const existingPeer = existingPeers[0] as Peer | undefined;
     const isNew = !existingPeer;
 
     // Verify signing key consistency (prevent signing key hijacking)
@@ -514,18 +525,26 @@ export class TrackerServer extends EventEmitter {
     }
 
     // Upsert peer into database
-    if (this.stmtUpsertPeer) {
-      this.stmtUpsertPeer.run(
-        from,
-        b32,
-        payload.displayName || 'Unknown',
-        payload.filesCount || 0,
-        payload.totalSize || 0,
-        Date.now(),
-        payload.streamingDestination || null,
-        signingKey || null
-      );
-    }
+    this.dbRun(`
+      INSERT INTO peers (destination, b32Address, displayName, filesCount, totalSize, lastSeen, streamingDestination, signingKey)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(destination) DO UPDATE SET
+        displayName = excluded.displayName,
+        filesCount = excluded.filesCount,
+        totalSize = excluded.totalSize,
+        lastSeen = excluded.lastSeen,
+        streamingDestination = excluded.streamingDestination,
+        signingKey = COALESCE(peers.signingKey, excluded.signingKey)
+    `, [
+      from,
+      b32,
+      payload.displayName || 'Unknown',
+      payload.filesCount || 0,
+      payload.totalSize || 0,
+      Date.now(),
+      payload.streamingDestination || null,
+      signingKey || null
+    ]);
 
     if (isNew) {
       console.log(`[Tracker] New peer: ${b32.substring(0, 16)}... (${payload.displayName || 'Unknown'})`);
@@ -548,28 +567,19 @@ export class TrackerServer extends EventEmitter {
     console.log(`[Tracker] Peer list requested by ${b32.substring(0, 16)}...`);
 
     // Check if peer exists
-    const existingPeer = this.stmtGetPeer?.get(from) as Peer | undefined;
+    const existingPeers = this.dbQuery('SELECT * FROM peers WHERE destination = ?', [from]);
+    const existingPeer = existingPeers[0] as Peer | undefined;
 
     if (!existingPeer) {
       // Auto-register peer
       console.log(`[Tracker] Auto-registering unknown peer: ${b32.substring(0, 16)}...`);
-      if (this.stmtUpsertPeer) {
-        this.stmtUpsertPeer.run(
-          from,
-          b32,
-          'Unknown',
-          0,
-          0,
-          Date.now(),
-          null,
-          signingKey || null
-        );
-      }
+      this.dbRun(`
+        INSERT INTO peers (destination, b32Address, displayName, filesCount, totalSize, lastSeen, streamingDestination, signingKey)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [from, b32, 'Unknown', 0, 0, Date.now(), null, signingKey || null]);
     } else {
       // Update last seen
-      if (this.stmtUpdateLastSeen) {
-        this.stmtUpdateLastSeen.run(Date.now(), from);
-      }
+      this.dbRun('UPDATE peers SET lastSeen = ? WHERE destination = ?', [Date.now(), from]);
     }
 
     this.sendPeersList(from);
@@ -577,9 +587,7 @@ export class TrackerServer extends EventEmitter {
 
   private handlePing(from: string, signingKey?: string): void {
     // Update last seen
-    if (this.stmtUpdateLastSeen) {
-      this.stmtUpdateLastSeen.run(Date.now(), from);
-    }
+    this.dbRun('UPDATE peers SET lastSeen = ? WHERE destination = ?', [Date.now(), from]);
 
     // Send pong
     this.sendMessage(from, {
@@ -590,11 +598,15 @@ export class TrackerServer extends EventEmitter {
   }
 
   private sendPeersList(to: string): void {
-    if (!this.stmtGetActivePeers) return;
-
-    // Get active peers (exclude requester, limit for large networks)
+    // Get active peers (exclude requester, random order, limit for large networks)
     const cutoff = Date.now() - this.config.peerTimeout;
-    const peersList = this.stmtGetActivePeers.all(to, cutoff, this.config.maxPeersPerResponse) as Peer[];
+    const peersList = this.dbQuery(`
+      SELECT destination, b32Address, displayName, filesCount, totalSize, streamingDestination
+      FROM peers
+      WHERE destination != ? AND lastSeen > ?
+      ORDER BY RANDOM()
+      LIMIT ?
+    `, [to, cutoff, this.config.maxPeersPerResponse]) as Peer[];
 
     this.sendMessage(to, {
       type: 'PEERS_LIST',
@@ -639,10 +651,8 @@ export class TrackerServer extends EventEmitter {
   }
 
   private cleanupInactivePeers(): void {
-    if (!this.stmtCleanupPeers) return;
-
     const cutoff = Date.now() - this.config.peerTimeout;
-    const result = this.stmtCleanupPeers.run(cutoff);
+    const result = this.dbRun('DELETE FROM peers WHERE lastSeen < ?', [cutoff]);
 
     if (result.changes > 0) {
       console.log(`[Tracker] Cleanup: removed ${result.changes} inactive peers`);
@@ -655,24 +665,19 @@ export class TrackerServer extends EventEmitter {
   }
 
   private getPeerCount(): number {
-    if (!this.stmtGetPeerCount) return 0;
     const cutoff = Date.now() - this.config.peerTimeout;
-    const row = this.stmtGetPeerCount.get(cutoff) as { count: number };
-    return row?.count || 0;
+    const rows = this.dbQuery('SELECT COUNT(*) as count FROM peers WHERE lastSeen > ?', [cutoff]);
+    return rows[0]?.count || 0;
   }
 
   getStats(): { peersCount: number; peers: Peer[] } {
-    if (!this.db) {
-      return { peersCount: 0, peers: [] };
-    }
-
     const cutoff = Date.now() - this.config.peerTimeout;
     const count = this.getPeerCount();
 
     // Only return first 1000 peers in stats to avoid memory issues
-    const peers = this.db.prepare(`
+    const peers = this.dbQuery(`
       SELECT * FROM peers WHERE lastSeen > ? ORDER BY lastSeen DESC LIMIT 1000
-    `).all(cutoff) as Peer[];
+    `, [cutoff]) as Peer[];
 
     return {
       peersCount: count,
@@ -690,6 +695,7 @@ export class TrackerServer extends EventEmitter {
 
   async stop(): Promise<void> {
     console.log('[Tracker] Stopping...');
+    this.isRunning = false;
 
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
@@ -711,6 +717,11 @@ export class TrackerServer extends EventEmitter {
       this.reconnectTimer = null;
     }
 
+    if (this.dbSaveTimer) {
+      clearInterval(this.dbSaveTimer);
+      this.dbSaveTimer = null;
+    }
+
     if (this.sam) {
       try {
         this.sam.close();
@@ -720,9 +731,12 @@ export class TrackerServer extends EventEmitter {
       this.sam = null;
     }
 
-    // Close SQLite database
+    // Save and close SQLite database
     if (this.db) {
       try {
+        // Final save before closing
+        this.saveDatabase();
+        console.log('[Tracker] Database saved');
         this.db.close();
         console.log('[Tracker] Database closed');
       } catch (e) {
@@ -731,16 +745,6 @@ export class TrackerServer extends EventEmitter {
       this.db = null;
     }
 
-    // Clear prepared statements
-    this.stmtUpsertPeer = null;
-    this.stmtGetPeer = null;
-    this.stmtDeletePeer = null;
-    this.stmtGetActivePeers = null;
-    this.stmtGetPeerCount = null;
-    this.stmtCleanupPeers = null;
-    this.stmtUpdateLastSeen = null;
-
-    this.isRunning = false;
     this.usedNonces.clear();
     console.log('[Tracker] Stopped');
   }

@@ -4,7 +4,7 @@
     "module": "commonjs",
     "lib": ["ES2020"],
     "outDir": "./dist/tracker",
-    "rootDir": "./src/tracker",
+    "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -13,6 +13,6 @@
     "declaration": false,
     "moduleResolution": "node"
   },
-  "include": ["src/tracker/**/*"],
+  "include": ["src/tracker/**/*", "src/shared/**/*"],
   "exclude": ["node_modules"]
 }

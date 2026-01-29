@@ -15,14 +15,15 @@
     "rebuild": "electron-rebuild -f -w better-sqlite3",
     "postinstall": "electron-rebuild -f -w better-sqlite3",
     "build:tracker": "tsc -p tsconfig.tracker.json",
-    "tracker": "npm run build:tracker && node dist/tracker/index.js",
-    "tracker:dev": "tsc -p tsconfig.tracker.json && node dist/tracker/index.js"
+    "tracker": "npm run build:tracker && node dist/tracker/tracker/index.js",
+    "tracker:dev": "tsc -p tsconfig.tracker.json && node dist/tracker/tracker/index.js"
   },
   "dependencies": {
     "@diva.exchange/i2p-sam": "^5.5.2",
     "better-sqlite3": "^12.6.2",
     "electron-store": "^8.1.0",
     "mime-types": "^2.1.35",
+    "sql.js": "^1.13.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {
@@ -32,6 +33,7 @@
     "@types/node": "^20.11.0",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.2.18",
+    "@types/sql.js": "^1.4.9",
     "@types/uuid": "^9.0.7",
     "@vitejs/plugin-react": "^5.1.2",
     "autoprefixer": "^10.4.17",
