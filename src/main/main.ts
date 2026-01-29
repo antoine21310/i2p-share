@@ -521,12 +521,39 @@ function setupIPC(): void {
 
   ipcMain.handle('tracker:set-addresses', async (_event, addresses: string[]) => {
     store.set('trackerAddresses', addresses);
+
     // Update torrent manager with new trackers
     if (torrentManager) {
       for (const addr of addresses) {
         torrentManager.addTracker(addr);
       }
     }
+
+    // Update TrackerClient and connect to new trackers
+    if (addresses.length > 0 && i2pConnection.isReady()) {
+      console.log(`[Main] Updating TrackerClient with ${addresses.length} tracker(s)...`);
+
+      // Add new addresses to TrackerClient
+      for (const addr of addresses) {
+        trackerClient.addTrackerAddress(addr);
+        knownTrackerDestinations.add(addr);
+      }
+
+      // Connect/reconnect to trackers
+      try {
+        await trackerClient.connect();
+        console.log('[Main] TrackerClient connected to new tracker(s)');
+
+        // Announce the tracker to DHT
+        const activeTracker = trackerClient.getActiveTracker();
+        if (activeTracker) {
+          announceTrackerToDHT(activeTracker);
+        }
+      } catch (err: any) {
+        console.error('[Main] TrackerClient connection failed:', err.message);
+      }
+    }
+
     return { success: true };
   });
 
@@ -819,6 +846,23 @@ async function bootstrapDHTViaTracker(destination: string, displayName: string):
   // Listen for peers discovered (they can also be used for DHT)
   trackerClient.on('peers:updated', (peers: any[]) => {
     console.log(`[Main] Tracker discovered ${peers.length} peers`);
+
+    // Save all peers to database and notify UI
+    const now = Math.floor(Date.now() / 1000);
+    for (const peer of peers) {
+      if (peer.destination || peer.b32Address) {
+        PeerOps.upsert({
+          peerId: peer.b32Address || peer.destination,
+          displayName: peer.displayName || 'Unknown',
+          filesCount: peer.filesCount || 0,
+          totalSize: peer.totalSize || 0
+        });
+      }
+    }
+
+    // Notify renderer that peers list has been updated
+    mainWindow?.webContents.send('peers:updated', { count: peers.length });
+
     // Peers can be used as DHT nodes too
     const peerNodes = peers
       .filter(p => p.destination && p.destination.length > 50)
@@ -1070,6 +1114,18 @@ async function startI2PAndConnect(): Promise<void> {
 
           // Add to known trackers
           knownTrackerDestinations.add(destinations.peerDiscovery);
+
+          // IMPORTANT: Also connect TrackerClient to our own embedded tracker
+          // This way we receive peer updates when others connect to our tracker
+          trackerClient.addTrackerAddress(destinations.peerDiscovery);
+          console.log('[Main] Added embedded tracker to TrackerClient');
+
+          // Connect/reconnect to include the embedded tracker
+          trackerClient.connect().then(() => {
+            console.log('[Main] TrackerClient connected (includes embedded tracker)');
+          }).catch(err => {
+            console.log('[Main] TrackerClient connect:', err.message);
+          });
 
           // Announce embedded tracker to DHT for network-wide discovery
           // This allows other peers to find our tracker automatically
