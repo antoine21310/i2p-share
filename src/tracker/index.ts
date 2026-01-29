@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { TrackerServer } from './tracker-server';
-import { I2PDManagerStandalone } from './i2pd-manager-standalone';
+import { I2PDManagerStandalone } from './i2pd-manager-standalone.js';
+import { TrackerServer } from './tracker-server.js';
 
 const args = process.argv.slice(2);
 

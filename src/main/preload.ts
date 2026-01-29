@@ -1,17 +1,44 @@
-import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
+import electron from 'electron';
+import type { IpcRendererEvent } from 'electron';
+
+const { contextBridge, ipcRenderer } = electron;
 
 // Types for exposed API
+interface AddTorrentResult {
+  infoHash: string;
+  name: string;
+}
+
+interface CreateTorrentResult {
+  magnetUri: string;
+  torrentData: Buffer;
+  infoHash: string;
+}
+
 interface ElectronAPI {
   // Search
   search: (query: string, filters: any) => Promise<any[]>;
 
-  // Downloads
+  // Downloads (legacy - delegates to torrent system)
   startDownload: (fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) => Promise<number>;
   pauseDownload: (downloadId: number) => Promise<void>;
   resumeDownload: (downloadId: number) => Promise<void>;
   cancelDownload: (downloadId: number) => Promise<void>;
   getDownloads: () => Promise<any[]>;
   getActiveUploads: () => Promise<any[]>;
+
+  // Torrents
+  addTorrent: (torrentData: ArrayBuffer) => Promise<AddTorrentResult>;
+  addMagnet: (magnetUri: string) => Promise<AddTorrentResult>;
+  createTorrent: (filePath: string, options?: { name?: string; comment?: string; private?: boolean }) => Promise<CreateTorrentResult>;
+  getTorrentStatus: (infoHash: string) => Promise<any>;
+  listTorrents: () => Promise<any[]>;
+  removeTorrent: (infoHash: string, deleteFiles?: boolean) => Promise<void>;
+  pauseTorrent: (infoHash: string) => Promise<void>;
+  resumeTorrent: (infoHash: string) => Promise<void>;
+  addTorrentPeer: (infoHash: string, destination: string) => Promise<boolean>;
+  getTorrentGlobalStats: () => Promise<any>;
+  addTorrentFile: () => Promise<AddTorrentResult | null>;
 
   // Shares
   addSharedFolder: () => Promise<any>;
@@ -45,6 +72,18 @@ interface ElectronAPI {
   getDisplayName: () => Promise<string>;
   setDisplayName: (name: string) => Promise<{ success: boolean }>;
 
+  // Embedded Tracker
+  getEmbeddedTrackerEnabled: () => Promise<boolean>;
+  setEmbeddedTrackerEnabled: (enabled: boolean) => Promise<{ success: boolean }>;
+  getEmbeddedTrackerStatus: () => Promise<{
+    isRunning: boolean;
+    b32Address: string | null;
+    btTrackerB32: string | null;
+    peersCount: number;
+    torrentsCount: number;
+    uptime: number;
+  }>;
+
   // Window controls
   minimizeWindow: () => Promise<void>;
   maximizeWindow: () => Promise<void>;
@@ -77,6 +116,30 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('download:list'),
   getActiveUploads: () =>
     ipcRenderer.invoke('uploads:active'),
+
+  // Torrents
+  addTorrent: (torrentData: ArrayBuffer) =>
+    ipcRenderer.invoke('torrent:add', Buffer.from(torrentData)),
+  addMagnet: (magnetUri: string) =>
+    ipcRenderer.invoke('torrent:addMagnet', magnetUri),
+  createTorrent: (filePath: string, options?: { name?: string; comment?: string; private?: boolean }) =>
+    ipcRenderer.invoke('torrent:create', filePath, options),
+  getTorrentStatus: (infoHash: string) =>
+    ipcRenderer.invoke('torrent:status', infoHash),
+  listTorrents: () =>
+    ipcRenderer.invoke('torrent:list'),
+  removeTorrent: (infoHash: string, deleteFiles?: boolean) =>
+    ipcRenderer.invoke('torrent:remove', infoHash, deleteFiles),
+  pauseTorrent: (infoHash: string) =>
+    ipcRenderer.invoke('torrent:pause', infoHash),
+  resumeTorrent: (infoHash: string) =>
+    ipcRenderer.invoke('torrent:resume', infoHash),
+  addTorrentPeer: (infoHash: string, destination: string) =>
+    ipcRenderer.invoke('torrent:addPeer', infoHash, destination),
+  getTorrentGlobalStats: () =>
+    ipcRenderer.invoke('torrent:globalStats'),
+  addTorrentFile: () =>
+    ipcRenderer.invoke('torrent:addFile'),
 
   // Shares
   addSharedFolder: () =>
@@ -130,6 +193,14 @@ const api: ElectronAPI = {
     ipcRenderer.invoke('profile:get-display-name'),
   setDisplayName: (name: string) =>
     ipcRenderer.invoke('profile:set-display-name', name),
+
+  // Embedded Tracker
+  getEmbeddedTrackerEnabled: () =>
+    ipcRenderer.invoke('embedded-tracker:get-enabled'),
+  setEmbeddedTrackerEnabled: (enabled: boolean) =>
+    ipcRenderer.invoke('embedded-tracker:set-enabled', enabled),
+  getEmbeddedTrackerStatus: () =>
+    ipcRenderer.invoke('embedded-tracker:get-status'),
 
   // Window controls
   minimizeWindow: () =>

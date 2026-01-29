@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useStore } from '../store';
 
+interface EmbeddedTrackerStatus {
+  isRunning: boolean;
+  b32Address: string | null;
+  btTrackerB32: string | null;
+  peersCount: number;
+  torrentsCount: number;
+  uptime: number;
+}
+
 export function SettingsPage() {
   const { networkStatus } = useStore();
   const [displayName, setDisplayName] = useState('');
@@ -10,6 +19,12 @@ export function SettingsPage() {
   const [activeTracker, setActiveTracker] = useState<string | null>(null);
   const [trackerSaving, setTrackerSaving] = useState(false);
   const [trackerSaved, setTrackerSaved] = useState(false);
+
+  // Embedded tracker state
+  const [embeddedTrackerEnabled, setEmbeddedTrackerEnabled] = useState(true);
+  const [embeddedTrackerStatus, setEmbeddedTrackerStatus] = useState<EmbeddedTrackerStatus | null>(null);
+  const [embeddedTrackerSaving, setEmbeddedTrackerSaving] = useState(false);
+
   const [settings, setSettings] = useState({
     maxUploadSpeed: 5,
     maxDownloadSpeed: 10,
@@ -29,6 +44,18 @@ export function SettingsPage() {
       setTrackerAddresses(addresses.join('\n'));
     });
     window.electron.getActiveTracker().then(setActiveTracker);
+
+    // Load embedded tracker settings
+    window.electron.getEmbeddedTrackerEnabled().then(setEmbeddedTrackerEnabled);
+    window.electron.getEmbeddedTrackerStatus().then(setEmbeddedTrackerStatus);
+  }, []);
+
+  // Refresh embedded tracker status periodically
+  useEffect(() => {
+    const interval = setInterval(() => {
+      window.electron.getEmbeddedTrackerStatus().then(setEmbeddedTrackerStatus);
+    }, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const handleSaveDisplayName = async () => {
@@ -65,6 +92,34 @@ export function SettingsPage() {
     } finally {
       setTrackerSaving(false);
     }
+  };
+
+  const handleToggleEmbeddedTracker = async (enabled: boolean) => {
+    setEmbeddedTrackerSaving(true);
+    try {
+      setEmbeddedTrackerEnabled(enabled);
+      await window.electron.setEmbeddedTrackerEnabled(enabled);
+      // Refresh status after a short delay
+      setTimeout(() => {
+        window.electron.getEmbeddedTrackerStatus().then(setEmbeddedTrackerStatus);
+      }, 1000);
+    } finally {
+      setEmbeddedTrackerSaving(false);
+    }
+  };
+
+  const formatUptime = (ms: number): string => {
+    if (ms < 1000) return '0s';
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m`;
+    }
+    if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`;
+    }
+    return `${seconds}s`;
   };
 
   return (
@@ -224,6 +279,91 @@ export function SettingsPage() {
                 <li>A random tracker is selected at connection</li>
                 <li>If one fails, another is automatically tried</li>
                 <li>Run your own: <code className="bg-dark-700 px-1 rounded">npm run tracker</code></li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        {/* Embedded Tracker Section */}
+        <section className="mb-8">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <svg className="w-5 h-5 text-primary-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+            </svg>
+            Embedded Tracker
+          </h2>
+          <div className="card p-6 space-y-4">
+            {/* Enable/Disable toggle */}
+            <label className="flex items-center justify-between cursor-pointer">
+              <div>
+                <p className="font-medium text-white">Enable Embedded Tracker</p>
+                <p className="text-sm text-dark-400">
+                  Become a tracker for the network. Helps other peers discover each other.
+                </p>
+              </div>
+              <Toggle
+                checked={embeddedTrackerEnabled}
+                onChange={handleToggleEmbeddedTracker}
+              />
+            </label>
+
+            {/* Tracker Status */}
+            {embeddedTrackerEnabled && embeddedTrackerStatus && (
+              <div className="bg-dark-800/50 rounded-lg p-4 space-y-3">
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${embeddedTrackerStatus.isRunning ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+                  <span className="text-sm text-dark-300">
+                    {embeddedTrackerStatus.isRunning ? 'Running' : 'Stopped'}
+                  </span>
+                  {embeddedTrackerStatus.isRunning && (
+                    <span className="text-xs text-dark-500">
+                      (uptime: {formatUptime(embeddedTrackerStatus.uptime)})
+                    </span>
+                  )}
+                </div>
+
+                {embeddedTrackerStatus.isRunning && (
+                  <>
+                    <div className="grid grid-cols-2 gap-4 text-sm">
+                      <div>
+                        <span className="text-dark-500">Connected Peers:</span>
+                        <span className="ml-2 text-white">{embeddedTrackerStatus.peersCount}</span>
+                      </div>
+                      <div>
+                        <span className="text-dark-500">Tracked Torrents:</span>
+                        <span className="ml-2 text-white">{embeddedTrackerStatus.torrentsCount}</span>
+                      </div>
+                    </div>
+
+                    {embeddedTrackerStatus.b32Address && (
+                      <div className="text-xs">
+                        <span className="text-dark-500">Peer Discovery:</span>
+                        <code className="ml-2 text-primary-400 break-all">
+                          {embeddedTrackerStatus.b32Address.substring(0, 24)}...
+                        </code>
+                      </div>
+                    )}
+
+                    {embeddedTrackerStatus.btTrackerB32 && (
+                      <div className="text-xs">
+                        <span className="text-dark-500">BT Tracker:</span>
+                        <code className="ml-2 text-primary-400 break-all">
+                          {embeddedTrackerStatus.btTrackerB32.substring(0, 24)}...
+                        </code>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="text-sm text-dark-400 bg-dark-800/50 rounded-lg p-3">
+              <p className="font-medium text-dark-300 mb-1">Why run a tracker?</p>
+              <ul className="list-disc list-inside space-y-1 text-xs">
+                <li>Helps the network by providing peer discovery</li>
+                <li>Increases resilience - more trackers = harder to censor</li>
+                <li>Your tracker is automatically discovered via DHT</li>
+                <li>Other clients can connect without manual configuration</li>
               </ul>
             </div>
           </div>

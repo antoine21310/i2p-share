@@ -1,16 +1,17 @@
-import { EventEmitter } from 'events';
 import { toB32 } from '@diva.exchange/i2p-sam';
-import crypto from 'crypto';
+import { EventEmitter } from 'events';
+
+// Get electron from global (set by bootstrap.cjs)
+const electron = (globalThis as any).__electron;
+const { app } = electron;
 import fs from 'fs';
 import path from 'path';
-import { app } from 'electron';
 import {
-  generateSigningKeypair,
-  createSignedMessage,
-  verifySignedMessage,
-  SignedMessage,
-  SigningKeypair
-} from '../shared/utils';
+    createSignedMessage,
+    generateSigningKeypair,
+    SigningKeypair,
+    verifySignedMessage
+} from '../shared/utils.js';
 
 interface TrackerPeer {
   destination: string;

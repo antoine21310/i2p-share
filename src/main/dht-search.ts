@@ -1,12 +1,14 @@
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
-import { RoutingOps, DHTCacheOps, PeerOps } from './database';
-import type { SearchResult, SearchFilters, DHTMessage, PeerAnnounce, FileIndex } from '../shared/types';
+import type { DHTMessage, PeerAnnounce, SearchFilters, SearchResult } from '../shared/types.js';
+import { DHTCacheOps, FileOps, PeerOps, RoutingOps } from './database.js';
 
 const K = 20; // Kademlia bucket size
 const ALPHA = 3; // Parallel lookups
 const ID_BITS = 160; // SHA1 produces 160-bit IDs
+const PEER_EXPIRATION = 30 * 60 * 1000; // 30 minutes
+const TOKEN_SECRET_ROTATION = 5 * 60 * 1000; // 5 minutes
 
 interface DHTNode {
   nodeId: string;
@@ -25,12 +27,32 @@ interface SearchContext {
   timeout: NodeJS.Timeout;
 }
 
+// BEP5: Peer info for a torrent
+interface TorrentPeer {
+  destination: string;
+  lastSeen: number;
+}
+
+// BEP5: Token for announce_peer authorization
+interface TokenInfo {
+  secret: string;
+  previousSecret: string;
+}
+
 export class DHTSearchEngine extends EventEmitter {
   private nodeId: string;
   private destination: string;
   private routingTable: Map<number, DHTNode[]> = new Map();
   private activeSearches: Map<string, SearchContext> = new Map();
   private messageHandler: ((from: string, message: any) => void) | null = null;
+
+  // BEP5: Peers storage by infoHash
+  private torrentPeers: Map<string, Map<string, TorrentPeer>> = new Map();
+  // BEP5: Token secret for announce authorization
+  private tokenInfo: TokenInfo;
+  private tokenRotationTimer: NodeJS.Timeout | null = null;
+  // Cache for tokens received from other nodes: Map<nodeId, token>
+  private tokenCache: Map<string, string> = new Map();
 
   constructor() {
     super();
@@ -42,6 +64,52 @@ export class DHTSearchEngine extends EventEmitter {
     for (let i = 0; i < ID_BITS; i++) {
       this.routingTable.set(i, []);
     }
+
+    // BEP5: Initialize token secret
+    this.tokenInfo = {
+      secret: crypto.randomBytes(16).toString('hex'),
+      previousSecret: crypto.randomBytes(16).toString('hex')
+    };
+
+    // Rotate token secret periodically
+    this.tokenRotationTimer = setInterval(() => {
+      this.rotateTokenSecret();
+    }, TOKEN_SECRET_ROTATION);
+  }
+
+  /**
+   * BEP5: Rotate token secret
+   */
+  private rotateTokenSecret(): void {
+    this.tokenInfo.previousSecret = this.tokenInfo.secret;
+    this.tokenInfo.secret = crypto.randomBytes(16).toString('hex');
+  }
+
+  /**
+   * BEP5: Generate token for a requesting node
+   */
+  private generateToken(nodeDestination: string): string {
+    return crypto.createHmac('sha1', this.tokenInfo.secret)
+      .update(nodeDestination)
+      .digest('hex')
+      .substring(0, 16);
+  }
+
+  /**
+   * BEP5: Verify token from announce_peer
+   */
+  private verifyToken(nodeDestination: string, token: string): boolean {
+    const currentToken = crypto.createHmac('sha1', this.tokenInfo.secret)
+      .update(nodeDestination)
+      .digest('hex')
+      .substring(0, 16);
+
+    const previousToken = crypto.createHmac('sha1', this.tokenInfo.previousSecret)
+      .update(nodeDestination)
+      .digest('hex')
+      .substring(0, 16);
+
+    return token === currentToken || token === previousToken;
   }
 
   setIdentity(publicKey: string, destination: string): void {
@@ -223,6 +291,12 @@ export class DHTSearchEngine extends EventEmitter {
   handleMessage(from: string, message: DHTMessage): void {
     this.updateNode(message.nodeId, from);
 
+    // Handle responses
+    if (message.payload && message.payload.isResponse) {
+      this.handleResponse(from, message);
+      return;
+    }
+
     switch (message.type) {
       case 'FIND_VALUE':
         this.handleFindValue(from, message);
@@ -239,6 +313,26 @@ export class DHTSearchEngine extends EventEmitter {
       case 'ANNOUNCE':
         this.handleAnnounce(from, message);
         break;
+      // BEP5: BitTorrent DHT peer discovery
+      case 'GET_PEERS':
+        this.handleGetPeers(from, message);
+        break;
+      case 'ANNOUNCE_PEER':
+        this.handleAnnouncePeer(from, message);
+        break;
+    }
+  }
+
+  private handleResponse(from: string, message: DHTMessage): void {
+    // Emit response event for anyone waiting (e.g. getPeers, search)
+    this.emit('message:response', message);
+
+    // If it's a GET_PEERS response, cache the token
+    if (message.type === 'GET_PEERS' && message.payload.token) {
+      // Store token associated with the node's ID
+      this.tokenCache.set(message.nodeId, message.payload.token);
+      // Also store by destination just in case
+      this.tokenCache.set(from, message.payload.token); 
     }
   }
 
@@ -380,7 +474,7 @@ export class DHTSearchEngine extends EventEmitter {
   }
 
   private searchLocalFiles(query: string, filters: SearchFilters): SearchResult[] {
-    const { FileOps } = require('./database');
+    // const { FileOps } = require('./database'); // Removed
     const files = FileOps.search(query);
 
     return files
@@ -493,6 +587,324 @@ export class DHTSearchEngine extends EventEmitter {
       this.updateNode(node.nodeId, node.destination);
     }
     console.log(`[DHT] Loaded ${nodes.length} nodes from database`);
+  }
+
+  // ============================================================================
+  // BEP5: BitTorrent DHT - get_peers and announce_peer
+  // ============================================================================
+
+  /**
+   * BEP5: Handle get_peers query
+   * Returns peers for the requested infoHash, or closer nodes
+   */
+  private handleGetPeers(from: string, message: DHTMessage): void {
+    const { infoHash, origin } = message.payload;
+    const targetId = infoHash; // infoHash IS the target ID
+
+    // Generate token for this requester
+    const token = this.generateToken(from);
+
+    // Check if we have peers for this infoHash
+    const peers = this.torrentPeers.get(infoHash);
+    const activePeers: string[] = [];
+
+    if (peers) {
+      const now = Date.now();
+      for (const [dest, peer] of peers) {
+        if (now - peer.lastSeen < PEER_EXPIRATION) {
+          activePeers.push(dest);
+        }
+      }
+    }
+
+    // Get closest nodes we know
+    const closerNodes = this.getClosestNodes(targetId, K)
+      .filter(n => n.nodeId !== message.nodeId)
+      .map(n => ({ nodeId: n.nodeId, destination: n.destination }));
+
+    // Send response
+    const response: DHTMessage = {
+      type: 'GET_PEERS',
+      nodeId: this.nodeId,
+      payload: {
+        token,
+        peers: activePeers.length > 0 ? activePeers : undefined,
+        nodes: closerNodes,
+        isResponse: true
+      },
+      timestamp: Date.now()
+    };
+
+    if (this.messageHandler) {
+      this.messageHandler(origin || from, response);
+    }
+
+    console.log(`[DHT] get_peers for ${infoHash.substring(0, 16)}...: ${activePeers.length} peers, ${closerNodes.length} nodes`);
+  }
+
+  /**
+   * BEP5: Handle announce_peer query
+   * Stores peer info for the announced infoHash
+   */
+  private handleAnnouncePeer(from: string, message: DHTMessage): void {
+    const { infoHash, port, token, origin } = message.payload;
+    const peerDestination = port || from; // In I2P, 'port' is the destination
+
+    // Verify token
+    if (!this.verifyToken(from, token)) {
+      console.log(`[DHT] announce_peer: invalid token from ${from.substring(0, 30)}...`);
+      return;
+    }
+
+    // Store peer
+    let peers = this.torrentPeers.get(infoHash);
+    if (!peers) {
+      peers = new Map();
+      this.torrentPeers.set(infoHash, peers);
+    }
+
+    peers.set(peerDestination, {
+      destination: peerDestination,
+      lastSeen: Date.now()
+    });
+
+    console.log(`[DHT] announce_peer: ${infoHash.substring(0, 16)}... from ${peerDestination.substring(0, 30)}...`);
+
+    // Send acknowledgment
+    const response: DHTMessage = {
+      type: 'ANNOUNCE_PEER',
+      nodeId: this.nodeId,
+      payload: {
+        isResponse: true
+      },
+      timestamp: Date.now()
+    };
+
+    if (this.messageHandler) {
+      this.messageHandler(origin || from, response);
+    }
+
+    // Emit event
+    this.emit('peer:announced', { infoHash, destination: peerDestination });
+  }
+
+  /**
+   * BEP5: Query DHT for peers who have a specific torrent
+   */
+  async getPeers(infoHash: string, timeout = 30000): Promise<string[]> {
+    return new Promise((resolve) => {
+      const searchId = uuidv4();
+      const foundPeers = new Set<string>();
+      const visited = new Set<string>();
+      const pending = new Set<string>();
+
+      // Timeout handler
+      const timeoutHandle = setTimeout(() => {
+        resolve(Array.from(foundPeers));
+      }, timeout);
+
+      // Get initial nodes to query
+      const closestNodes = this.getClosestNodes(infoHash, ALPHA);
+
+      if (closestNodes.length === 0) {
+        clearTimeout(timeoutHandle);
+        resolve([]);
+        return;
+      }
+
+      // Response handler
+      const handleResponse = (response: any) => {
+        if (response.payload?.isResponse && response.type === 'GET_PEERS') {
+          // Add found peers
+          if (response.payload.peers) {
+            for (const peer of response.payload.peers) {
+              if (peer !== this.destination) {
+                foundPeers.add(peer);
+              }
+            }
+          }
+
+          // Query closer nodes
+          if (response.payload.nodes) {
+            for (const node of response.payload.nodes) {
+              if (!visited.has(node.nodeId) && pending.size < ALPHA * 2) {
+                this.updateNode(node.nodeId, node.destination);
+                sendGetPeers(node);
+              }
+            }
+          }
+
+          pending.delete(response.nodeId);
+
+          // Check if we're done
+          if (pending.size === 0 || foundPeers.size >= 50) {
+            clearTimeout(timeoutHandle);
+            this.removeListener('message:response', handleResponse);
+            resolve(Array.from(foundPeers));
+          }
+        }
+      };
+
+      // Listen for responses (temporary)
+      this.on('message:response', handleResponse);
+
+      // Send get_peers to a node
+      const sendGetPeers = (node: DHTNode) => {
+        if (visited.has(node.nodeId)) return;
+        visited.add(node.nodeId);
+        pending.add(node.nodeId);
+
+        const message: DHTMessage = {
+          type: 'GET_PEERS',
+          nodeId: this.nodeId,
+          payload: {
+            infoHash,
+            origin: this.destination
+          },
+          timestamp: Date.now()
+        };
+
+        if (this.messageHandler) {
+          this.messageHandler(node.destination, message);
+        }
+      };
+
+      // Start querying
+      for (const node of closestNodes) {
+        sendGetPeers(node);
+      }
+    });
+  }
+
+  /**
+   * BEP5: Announce that we have a torrent to the DHT
+   */
+  async announcePeer(infoHash: string): Promise<void> {
+    if (!this.destination) {
+      console.log('[DHT] Cannot announce: no destination set');
+      return;
+    }
+
+    console.log(`[DHT] Announcing peer for ${infoHash.substring(0, 16)}...`);
+
+    // First, do get_peers to get tokens
+    const closestNodes = this.getClosestNodes(infoHash, K);
+    
+    // We need to wait for tokens.
+    // Send get_peers to all closest nodes
+    for (const node of closestNodes) {
+      const message: DHTMessage = {
+        type: 'GET_PEERS',
+        nodeId: this.nodeId,
+        payload: {
+          infoHash,
+          origin: this.destination
+        },
+        timestamp: Date.now()
+      };
+
+      if (this.messageHandler) {
+        this.messageHandler(node.destination, message);
+      }
+    }
+
+    // Wait for responses to populate tokenCache
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    // Send announce_peer to nodes we have tokens for
+    let announcedCount = 0;
+    
+    for (const node of closestNodes) {
+      // Try to get token by nodeId or destination
+      const token = this.tokenCache.get(node.nodeId) || this.tokenCache.get(node.destination);
+      
+      if (!token) {
+        // Skip nodes that didn't give us a token
+        continue;
+      }
+
+      const message: DHTMessage = {
+        type: 'ANNOUNCE_PEER',
+        nodeId: this.nodeId,
+        payload: {
+          infoHash,
+          port: this.destination, // In I2P we send destination as 'port'
+          token,
+          origin: this.destination
+        },
+        timestamp: Date.now()
+      };
+
+      if (this.messageHandler) {
+        this.messageHandler(node.destination, message);
+        announcedCount++;
+      }
+    }
+    
+    console.log(`[DHT] Announced to ${announcedCount} nodes (with valid tokens)`);
+    // Also store locally
+    let peers = this.torrentPeers.get(infoHash);
+    if (!peers) {
+      peers = new Map();
+      this.torrentPeers.set(infoHash, peers);
+    }
+    peers.set(this.destination, {
+      destination: this.destination,
+      lastSeen: Date.now()
+    });
+
+    this.emit('announce_peer:complete', { infoHash });
+  }
+
+  /**
+   * BEP5: Get locally stored peers for an infoHash
+   */
+  getStoredPeers(infoHash: string): string[] {
+    const peers = this.torrentPeers.get(infoHash);
+    if (!peers) return [];
+
+    const now = Date.now();
+    const activePeers: string[] = [];
+
+    for (const [dest, peer] of peers) {
+      if (now - peer.lastSeen < PEER_EXPIRATION) {
+        activePeers.push(dest);
+      }
+    }
+
+    return activePeers;
+  }
+
+  /**
+   * BEP5: Clean up expired peers
+   */
+  cleanupExpiredPeers(): void {
+    const now = Date.now();
+
+    for (const [infoHash, peers] of this.torrentPeers) {
+      for (const [dest, peer] of peers) {
+        if (now - peer.lastSeen >= PEER_EXPIRATION) {
+          peers.delete(dest);
+        }
+      }
+
+      if (peers.size === 0) {
+        this.torrentPeers.delete(infoHash);
+      }
+    }
+  }
+
+  /**
+   * Cleanup resources
+   */
+  cleanup(): void {
+    if (this.tokenRotationTimer) {
+      clearInterval(this.tokenRotationTimer);
+      this.tokenRotationTimer = null;
+    }
+    this.torrentPeers.clear();
+    this.activeSearches.clear();
+    this.removeAllListeners();
   }
 }
 

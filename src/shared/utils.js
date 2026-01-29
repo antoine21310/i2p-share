@@ -1,120 +1,81 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.formatBytes = formatBytes;
-exports.formatSpeed = formatSpeed;
-exports.formatDuration = formatDuration;
-exports.formatRelativeTime = formatRelativeTime;
-exports.truncateDestination = truncateDestination;
-exports.sanitizeFilename = sanitizeFilename;
-exports.validateSearchQuery = validateSearchQuery;
-exports.validateI2PDestination = validateI2PDestination;
-exports.validateDisplayName = validateDisplayName;
-exports.getAvailableDiskSpace = getAvailableDiskSpace;
-exports.hasEnoughDiskSpace = hasEnoughDiskSpace;
-exports.sha256 = sha256;
-exports.generateSigningKeypair = generateSigningKeypair;
-exports.signMessageEd25519 = signMessageEd25519;
-exports.verifySignatureEd25519 = verifySignatureEd25519;
-exports.createSignedMessage = createSignedMessage;
-exports.verifySignedMessage = verifySignedMessage;
-exports.sha1 = sha1;
-exports.randomHex = randomHex;
-exports.generateNonce = generateNonce;
-exports.signMessage = signMessage;
-exports.verifySignature = verifySignature;
-exports.hashFileStream = hashFileStream;
-exports.calculateBackoff = calculateBackoff;
-exports.sleep = sleep;
-exports.withRetry = withRetry;
-exports.cleanupEventEmitter = cleanupEventEmitter;
-exports.onceWithTimeout = onceWithTimeout;
 // Shared utilities - DO NOT duplicate in other files!
-const crypto_1 = __importDefault(require("crypto"));
-const fs_1 = __importDefault(require("fs"));
-const path_1 = __importDefault(require("path"));
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+
 // ============================================================================
 // FORMATTING UTILITIES
 // ============================================================================
+
 /**
  * Format bytes to human readable string
  */
-function formatBytes(bytes) {
-    if (bytes === 0)
-        return '0 B';
-    if (bytes < 0)
-        return 'Invalid';
+export function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    if (bytes < 0) return 'Invalid';
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     const index = Math.min(i, sizes.length - 1);
     return parseFloat((bytes / Math.pow(k, index)).toFixed(2)) + ' ' + sizes[index];
 }
+
 /**
  * Format bytes per second to human readable speed
  */
-function formatSpeed(bytesPerSec) {
-    if (bytesPerSec <= 0)
-        return '0 B/s';
+export function formatSpeed(bytesPerSec) {
+    if (bytesPerSec <= 0) return '0 B/s';
     return formatBytes(bytesPerSec) + '/s';
 }
+
 /**
  * Format duration in milliseconds to human readable string
  */
-function formatDuration(ms) {
-    if (ms < 1000)
-        return 'less than a second';
+export function formatDuration(ms) {
+    if (ms < 1000) return 'less than a second';
     const seconds = Math.floor(ms / 1000);
     const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
     const days = Math.floor(hours / 24);
-    if (days > 0)
-        return `${days}d ${hours % 24}h`;
-    if (hours > 0)
-        return `${hours}h ${minutes % 60}m`;
-    if (minutes > 0)
-        return `${minutes}m ${seconds % 60}s`;
+    if (days > 0) return `${days}d ${hours % 24}h`;
+    if (hours > 0) return `${hours}h ${minutes % 60}m`;
+    if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
     return `${seconds}s`;
 }
+
 /**
  * Format timestamp to relative time (e.g., "2 hours ago")
  */
-function formatRelativeTime(timestamp) {
+export function formatRelativeTime(timestamp) {
     const now = Date.now();
     const diff = now - timestamp;
-    if (diff < 60000)
-        return 'just now';
-    if (diff < 3600000)
-        return `${Math.floor(diff / 60000)}m ago`;
-    if (diff < 86400000)
-        return `${Math.floor(diff / 3600000)}h ago`;
-    if (diff < 604800000)
-        return `${Math.floor(diff / 86400000)}d ago`;
+    if (diff < 60000) return 'just now';
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+    if (diff < 604800000) return `${Math.floor(diff / 86400000)}d ago`;
     return new Date(timestamp).toLocaleDateString();
 }
+
 /**
  * Truncate I2P destination for display
  */
-function truncateDestination(dest, length = 16) {
-    if (!dest)
-        return 'Unknown';
-    if (dest.length <= length)
-        return dest;
+export function truncateDestination(dest, length = 16) {
+    if (!dest) return 'Unknown';
+    if (dest.length <= length) return dest;
     return dest.substring(0, length) + '...';
 }
+
 // ============================================================================
 // VALIDATION UTILITIES
 // ============================================================================
+
 /**
  * Validate and sanitize filename to prevent path traversal
  */
-function sanitizeFilename(filename) {
-    if (!filename)
-        return 'unnamed';
+export function sanitizeFilename(filename) {
+    if (!filename) return 'unnamed';
     // Remove path separators and dangerous characters
-    let safe = path_1.default.basename(filename);
+    let safe = path.basename(filename);
     safe = safe.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
     // Prevent hidden files on Unix
     if (safe.startsWith('.')) {
@@ -122,16 +83,17 @@ function sanitizeFilename(filename) {
     }
     // Limit length
     if (safe.length > 255) {
-        const ext = path_1.default.extname(safe);
-        const name = path_1.default.basename(safe, ext);
+        const ext = path.extname(safe);
+        const name = path.basename(safe, ext);
         safe = name.substring(0, 255 - ext.length) + ext;
     }
     return safe || 'unnamed';
 }
+
 /**
  * Validate search query
  */
-function validateSearchQuery(query) {
+export function validateSearchQuery(query) {
     if (!query || typeof query !== 'string') {
         return { valid: false, sanitized: '', error: 'Query must be a non-empty string' };
     }
@@ -144,20 +106,19 @@ function validateSearchQuery(query) {
     }
     return { valid: true, sanitized };
 }
+
 /**
  * Validate I2P destination format
  */
-function validateI2PDestination(dest) {
-    if (!dest || typeof dest !== 'string')
-        return false;
+export function validateI2PDestination(dest) {
+    if (!dest || typeof dest !== 'string') return false;
     // Full destination is base64, typically 516+ characters ending in AAAA
     if (dest.length > 100) {
         // Check if it's valid base64
         try {
             const decoded = Buffer.from(dest, 'base64');
             return decoded.length >= 387; // Minimum destination size
-        }
-        catch {
+        } catch {
             return false;
         }
     }
@@ -165,10 +126,11 @@ function validateI2PDestination(dest) {
     const b32Regex = /^[a-z2-7]{52}(\.b32\.i2p)?$/i;
     return b32Regex.test(dest);
 }
+
 /**
  * Validate display name
  */
-function validateDisplayName(name) {
+export function validateDisplayName(name) {
     if (!name || typeof name !== 'string') {
         return { valid: false, sanitized: 'Anonymous', error: 'Name must be a string' };
     }
@@ -179,20 +141,22 @@ function validateDisplayName(name) {
     }
     return { valid: true, sanitized };
 }
+
 // ============================================================================
 // DISK SPACE UTILITIES
 // ============================================================================
+
 /**
  * Get available disk space for a path (cross-platform)
  */
-async function getAvailableDiskSpace(targetPath) {
-    return new Promise((resolve) => {
+export async function getAvailableDiskSpace(targetPath) {
+    return new Promise(async (resolve) => {
         try {
             // Use statfs on supported platforms
             if (process.platform === 'win32') {
                 // On Windows, use child_process to run wmic
-                const { exec } = require('child_process');
-                const drive = path_1.default.parse(targetPath).root || 'C:\\';
+                const { exec } = await import('child_process');
+                const drive = path.parse(targetPath).root || 'C:\\';
                 const driveLetter = drive.charAt(0).toUpperCase();
                 exec(`wmic logicaldisk where "DeviceID='${driveLetter}:'" get FreeSpace /format:value`, (error, stdout) => {
                     if (error) {
@@ -202,10 +166,9 @@ async function getAvailableDiskSpace(targetPath) {
                     const match = stdout.match(/FreeSpace=(\d+)/);
                     resolve(match ? parseInt(match[1], 10) : 0);
                 });
-            }
-            else {
+            } else {
                 // On Unix-like systems, use fs.statfs
-                fs_1.default.statfs(targetPath, (err, stats) => {
+                fs.statfs(targetPath, (err, stats) => {
                     if (err) {
                         resolve(0);
                         return;
@@ -213,16 +176,16 @@ async function getAvailableDiskSpace(targetPath) {
                     resolve(stats.bavail * stats.bsize);
                 });
             }
-        }
-        catch {
+        } catch {
             resolve(0);
         }
     });
 }
+
 /**
  * Check if there's enough disk space for a download
  */
-async function hasEnoughDiskSpace(targetPath, requiredBytes, minFreeBytes = 100 * 1024 * 1024) {
+export async function hasEnoughDiskSpace(targetPath, requiredBytes, minFreeBytes = 100 * 1024 * 1024) {
     const available = await getAvailableDiskSpace(targetPath);
     const totalRequired = requiredBytes + minFreeBytes;
     return {
@@ -231,67 +194,71 @@ async function hasEnoughDiskSpace(targetPath, requiredBytes, minFreeBytes = 100 
         required: totalRequired
     };
 }
+
 // ============================================================================
 // CRYPTO UTILITIES (using Node.js crypto, NOT crypto-js)
 // ============================================================================
+
 /**
  * Generate SHA256 hash of data
  */
-function sha256(data) {
-    return crypto_1.default.createHash('sha256').update(data).digest('hex');
+export function sha256(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
 }
+
 /**
  * Generate a new Ed25519 keypair for message signing
  */
-function generateSigningKeypair() {
-    const { publicKey, privateKey } = crypto_1.default.generateKeyPairSync('ed25519');
+export function generateSigningKeypair() {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
     return {
         publicKey: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
         privateKey: privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
     };
 }
+
 /**
  * Sign a message with Ed25519 private key
  */
-function signMessageEd25519(message, privateKeyBase64) {
+export function signMessageEd25519(message, privateKeyBase64) {
     try {
         const privateKeyDer = Buffer.from(privateKeyBase64, 'base64');
-        const privateKey = crypto_1.default.createPrivateKey({
+        const privateKey = crypto.createPrivateKey({
             key: privateKeyDer,
             format: 'der',
             type: 'pkcs8'
         });
-        const signature = crypto_1.default.sign(null, Buffer.from(message, 'utf8'), privateKey);
+        const signature = crypto.sign(null, Buffer.from(message, 'utf8'), privateKey);
         return signature.toString('base64');
-    }
-    catch (error) {
+    } catch (error) {
         console.error('[Crypto] Failed to sign message:', error);
         return '';
     }
 }
+
 /**
  * Verify an Ed25519 signature
  */
-function verifySignatureEd25519(message, signature, publicKeyBase64) {
+export function verifySignatureEd25519(message, signature, publicKeyBase64) {
     try {
         const publicKeyDer = Buffer.from(publicKeyBase64, 'base64');
-        const publicKey = crypto_1.default.createPublicKey({
+        const publicKey = crypto.createPublicKey({
             key: publicKeyDer,
             format: 'der',
             type: 'spki'
         });
         const signatureBuffer = Buffer.from(signature, 'base64');
-        return crypto_1.default.verify(null, Buffer.from(message, 'utf8'), publicKey, signatureBuffer);
-    }
-    catch (error) {
+        return crypto.verify(null, Buffer.from(message, 'utf8'), publicKey, signatureBuffer);
+    } catch (error) {
         console.error('[Crypto] Failed to verify signature:', error);
         return false;
     }
 }
+
 /**
  * Create and sign a message
  */
-function createSignedMessage(data, privateKey, publicKey) {
+export function createSignedMessage(data, privateKey, publicKey) {
     const nonce = generateNonce();
     const timestamp = Date.now();
     // Create canonical message for signing
@@ -305,12 +272,12 @@ function createSignedMessage(data, privateKey, publicKey) {
         signingKey: publicKey
     };
 }
+
 /**
  * Verify a signed message
  * Returns the data if valid, throws if invalid
  */
-function verifySignedMessage(message, maxAgeMs = 5 * 60 * 1000 // 5 minutes default
-) {
+export function verifySignedMessage(message, maxAgeMs = 5 * 60 * 1000) {
     // Check timestamp is recent
     const age = Date.now() - message.timestamp;
     if (age > maxAgeMs) {
@@ -331,78 +298,87 @@ function verifySignedMessage(message, maxAgeMs = 5 * 60 * 1000 // 5 minutes defa
     }
     return { valid: true, data: message.data };
 }
+
 /**
  * Generate SHA1 hash (for DHT node IDs)
  */
-function sha1(data) {
-    return crypto_1.default.createHash('sha1').update(data).digest('hex');
+export function sha1(data) {
+    return crypto.createHash('sha1').update(data).digest('hex');
 }
+
 /**
  * Generate random bytes as hex string
  */
-function randomHex(bytes = 16) {
-    return crypto_1.default.randomBytes(bytes).toString('hex');
+export function randomHex(bytes = 16) {
+    return crypto.randomBytes(bytes).toString('hex');
 }
+
 /**
  * Generate a nonce for message replay protection
  */
-function generateNonce() {
-    return crypto_1.default.randomBytes(16).toString('hex') + '-' + Date.now().toString(36);
+export function generateNonce() {
+    return crypto.randomBytes(16).toString('hex') + '-' + Date.now().toString(36);
 }
+
 /**
  * Sign a message with HMAC-SHA256
  */
-function signMessage(message, secret) {
-    return crypto_1.default.createHmac('sha256', secret).update(message).digest('hex');
+export function signMessage(message, secret) {
+    return crypto.createHmac('sha256', secret).update(message).digest('hex');
 }
+
 /**
  * Verify a message signature
  */
-function verifySignature(message, signature, secret) {
+export function verifySignature(message, signature, secret) {
     const expected = signMessage(message, secret);
-    return crypto_1.default.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'));
+    return crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'));
 }
+
 /**
  * Calculate file hash with streaming (memory efficient)
  */
-function hashFileStream(filePath) {
+export function hashFileStream(filePath) {
     return new Promise((resolve, reject) => {
-        const hash = crypto_1.default.createHash('sha256');
-        const stream = fs_1.default.createReadStream(filePath, { highWaterMark: 64 * 1024 * 1024 });
+        const hash = crypto.createHash('sha256');
+        const stream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 * 1024 });
         stream.on('data', (chunk) => hash.update(chunk));
         stream.on('end', () => resolve(hash.digest('hex')));
         stream.on('error', reject);
     });
 }
+
 // ============================================================================
 // RETRY UTILITIES
 // ============================================================================
+
 /**
  * Calculate exponential backoff delay
  */
-function calculateBackoff(attempt, baseDelayMs = 5000, maxDelayMs = 60000) {
+export function calculateBackoff(attempt, baseDelayMs = 5000, maxDelayMs = 60000) {
     const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
-    // Add jitter (±20%)
+    // Add jitter (+/-20%)
     const jitter = delay * 0.2 * (Math.random() - 0.5);
     return Math.round(delay + jitter);
 }
+
 /**
  * Sleep for specified milliseconds
  */
-function sleep(ms) {
+export function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
+
 /**
  * Retry a function with exponential backoff
  */
-async function withRetry(fn, options = {}) {
+export async function withRetry(fn, options = {}) {
     const { maxRetries = 5, baseDelayMs = 5000, maxDelayMs = 60000, onRetry } = options;
     let lastError;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
             return await fn();
-        }
-        catch (error) {
+        } catch (error) {
             lastError = error;
             if (attempt < maxRetries) {
                 const delay = calculateBackoff(attempt, baseDelayMs, maxDelayMs);
@@ -413,20 +389,23 @@ async function withRetry(fn, options = {}) {
     }
     throw lastError;
 }
+
 // ============================================================================
 // EVENT EMITTER UTILITIES
 // ============================================================================
+
 /**
  * Cleanup helper for EventEmitter
  * Call this in your class destructor/cleanup method
  */
-function cleanupEventEmitter(emitter) {
+export function cleanupEventEmitter(emitter) {
     emitter.removeAllListeners();
 }
+
 /**
  * Create a one-time event listener with timeout
  */
-function onceWithTimeout(emitter, event, timeoutMs) {
+export function onceWithTimeout(emitter, event, timeoutMs) {
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
             emitter.removeListener(event, handler);

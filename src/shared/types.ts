@@ -151,7 +151,7 @@ export type TrackerMessageType =
   | 'ACK';
 
 export interface DHTMessage {
-  type: 'PING' | 'PONG' | 'FIND_NODE' | 'FIND_VALUE' | 'STORE' | 'ANNOUNCE';
+  type: 'PING' | 'PONG' | 'FIND_NODE' | 'FIND_VALUE' | 'STORE' | 'ANNOUNCE' | 'GET_PEERS' | 'ANNOUNCE_PEER';
   nodeId: string;
   payload: any;
   timestamp: number;
@@ -203,19 +203,21 @@ export interface FileIndex {
 }
 
 // ============================================================================
-// STREAMING PROTOCOL
+// BITTORRENT PROTOCOL (replaces streaming protocol)
 // ============================================================================
 
-export const MSG_FILE_REQUEST = 0x01;
-export const MSG_FILE_HEADER = 0x02;
-export const MSG_FILE_CHUNK = 0x03;
-export const MSG_FILE_COMPLETE = 0x04;
-export const MSG_FILE_ERROR = 0x05;
+// Re-export torrent types for convenience
+export {
+    AnnounceRequest,
+    AnnounceResponse, TrackerPeer as BTTrackerPeer, BitField, PeerInfo, PieceInfo, ScrapeInfo, TORRENT_CONSTANTS, TorrentFile, TorrentInfo, TorrentMetadata, TorrentState,
+    TorrentStatus, calculatePieceLength
+} from './torrent-types.js';
 
+// Legacy type aliases for backward compatibility
 export interface StreamDownload {
   id: number;
   filename: string;
-  fileHash: string;
+  fileHash: string;        // Maps to infoHash for torrents
   peerId: string;
   peerName: string;
   totalSize: number;
@@ -226,12 +228,12 @@ export interface StreamDownload {
   startTime: number;
   lastError?: string;
   retryCount: number;
-  chunkMap?: boolean[];
+  chunkMap?: boolean[];    // Maps to bitfield for torrents
 }
 
 export interface UploadSession {
   clientId: string;
-  fileHash: string;
+  fileHash: string;        // Maps to infoHash for torrents
   filename: string;
   totalSize: number;
   bytesSent: number;
@@ -279,32 +281,42 @@ export interface AppConfig {
 // ============================================================================
 
 export const CONSTANTS = {
-  // Chunk sizes
-  STREAMING_CHUNK_SIZE: 64 * 1024,      // 64KB for streaming
-  PROGRESS_CHUNK_SIZE: 256 * 1024,      // 256KB for progress updates
-  HASH_CHUNK_SIZE: 64 * 1024 * 1024,    // 64MB for file hashing
+  // BitTorrent block/piece sizes
+  BLOCK_SIZE: 16 * 1024,                  // 16KB standard BitTorrent block
+  MIN_PIECE_LENGTH: 16 * 1024,            // 16KB minimum piece size
+  MAX_PIECE_LENGTH: 16 * 1024 * 1024,     // 16MB maximum piece size
+  HASH_CHUNK_SIZE: 64 * 1024 * 1024,      // 64MB for file hashing
 
   // Timeouts (ms)
-  CONNECTION_TIMEOUT: 120000,            // 2 minutes for I2P connections
-  REQUEST_TIMEOUT: 60000,                // 1 minute for requests
-  ANNOUNCE_INTERVAL: 2 * 60 * 1000,      // 2 minutes
-  REFRESH_INTERVAL: 60 * 1000,           // 1 minute
-  PEER_TIMEOUT: 5 * 60 * 1000,           // 5 minutes
+  CONNECTION_TIMEOUT: 120000,             // 2 minutes for I2P connections
+  REQUEST_TIMEOUT: 60000,                 // 1 minute for requests
+  ANNOUNCE_INTERVAL: 30 * 60 * 1000,      // 30 minutes (BEP3 standard)
+  MIN_ANNOUNCE_INTERVAL: 60 * 1000,       // 1 minute minimum
+  REFRESH_INTERVAL: 60 * 1000,            // 1 minute
+  PEER_TIMEOUT: 5 * 60 * 1000,            // 5 minutes
+  KEEP_ALIVE_INTERVAL: 2 * 60 * 1000,     // 2 minutes (BT keep-alive)
 
   // Retry settings
   MAX_RETRIES: 5,
-  RETRY_BASE_DELAY: 5000,                // 5 seconds
-  RETRY_MAX_DELAY: 60000,                // 1 minute max
+  RETRY_BASE_DELAY: 5000,                 // 5 seconds
+  RETRY_MAX_DELAY: 60000,                 // 1 minute max
 
-  // Limits
+  // BitTorrent limits
   MAX_PARALLEL_DOWNLOADS: 3,
   MAX_UPLOAD_SLOTS: 10,
+  MAX_PEERS_PER_TORRENT: 50,
   MAX_PEERS_PER_RESPONSE: 100,
+  MAX_OUTSTANDING_REQUESTS: 10,           // Per peer
   MIN_FREE_SPACE_BYTES: 100 * 1024 * 1024, // 100MB minimum
 
   // File limits
-  MIN_FILE_SIZE: 1024,                   // 1KB
+  MIN_FILE_SIZE: 1024,                    // 1KB
   MAX_FILE_SIZE: 100 * 1024 * 1024 * 1024, // 100GB
+
+  // Choking algorithm
+  CHOKE_INTERVAL: 10 * 1000,              // 10 seconds
+  OPTIMISTIC_UNCHOKE_INTERVAL: 30 * 1000, // 30 seconds
+  MAX_UNCHOKED_PEERS: 4,                  // Standard BitTorrent
 } as const;
 
 // ============================================================================
@@ -347,12 +359,25 @@ export type IPCChannels = {
   'search:query': (query: string, filters: SearchFilters) => Promise<SearchResult[]>;
   'search:cancel': () => Promise<void>;
 
-  // Downloads
+  // Downloads (legacy - maps to torrent operations)
   'download:start': (fileHash: string, peerId: string, filename: string, size: number) => Promise<number>;
-  'download:pause': (downloadId: number) => Promise<void>;
-  'download:resume': (downloadId: number) => Promise<void>;
-  'download:cancel': (downloadId: number) => Promise<void>;
+  'download:pause': (downloadId: string) => Promise<void>;
+  'download:resume': (downloadId: string) => Promise<void>;
+  'download:cancel': (downloadId: string) => Promise<void>;
   'download:list': () => Promise<Download[]>;
+
+  // Torrent operations (new BitTorrent-based API)
+  'torrent:add': (torrentData: Buffer) => Promise<{ infoHash: string; name: string }>;
+  'torrent:addMagnet': (magnetUri: string) => Promise<{ infoHash: string; name: string }>;
+  'torrent:addFile': () => Promise<{ infoHash: string; name: string } | null>;
+  'torrent:create': (filePath: string, options?: { name?: string; trackers?: string[] }) => Promise<{ magnetUri: string; torrentData: Buffer; infoHash: string }>;
+  'torrent:status': (infoHash: string) => Promise<any | null>;
+  'torrent:list': () => Promise<any[]>;
+  'torrent:remove': (infoHash: string, deleteFiles?: boolean) => Promise<{ success: boolean }>;
+  'torrent:pause': (infoHash: string) => Promise<{ success: boolean }>;
+  'torrent:resume': (infoHash: string) => Promise<{ success: boolean }>;
+  'torrent:addPeer': (infoHash: string, destination: string) => Promise<boolean>;
+  'torrent:globalStats': () => Promise<{ totalDownloadSpeed: number; totalUploadSpeed: number; activeTorrents: number; totalPeers: number }>;
 
   // Shares
   'shares:add-folder': (path: string) => Promise<SharedFolder>;

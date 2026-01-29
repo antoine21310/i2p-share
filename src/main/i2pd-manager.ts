@@ -1,11 +1,14 @@
+import { ChildProcess, spawn } from 'child_process';
 import { EventEmitter } from 'events';
-import { app } from 'electron';
-import path from 'path';
-import fs from 'fs';
+
+// Get electron from global (set by bootstrap.cjs)
+const electron = (globalThis as any).__electron;
+const { app } = electron;
+import fs, { createWriteStream } from 'fs';
+import http from 'http';
 import https from 'https';
-import { spawn, ChildProcess } from 'child_process';
-import { createWriteStream } from 'fs';
-import { pipeline } from 'stream/promises';
+import net from 'net';
+import path from 'path';
 
 // i2pd release URLs for each platform
 const I2PD_VERSION = '2.54.0';
@@ -123,7 +126,7 @@ export class I2PDManager extends EventEmitter {
           return;
         }
 
-        const protocol = downloadUrl.startsWith('https') ? https : require('http');
+        const protocol = downloadUrl.startsWith('https') ? https : http;
 
         protocol.get(downloadUrl, (response: any) => {
           // Handle redirects
@@ -287,7 +290,7 @@ enabled = false
 enabled = false
 
 [upnp]
-enabled = true
+enabled = false
 `;
 
     fs.writeFileSync(configPath, config, 'utf-8');
@@ -301,7 +304,7 @@ enabled = true
 
   // Check if SAM bridge is already available (external i2pd running)
   async isSAMAvailable(): Promise<boolean> {
-    const net = require('net');
+    // const net = require('net');
     return new Promise((resolve) => {
       const socket = new net.Socket();
       socket.setTimeout(2000);
@@ -389,7 +392,7 @@ enabled = true
 
   private async waitForSAM(timeout = 60000): Promise<void> {
     const startTime = Date.now();
-    const net = require('net');
+    // const net = require('net');
 
     while (Date.now() - startTime < timeout) {
       try {
@@ -467,7 +470,7 @@ enabled = true
 
   // Get tunnel statistics from i2pd HTTP API
   async getTunnelStats(): Promise<{ inbound: number; outbound: number; transit: number }> {
-    const http = require('http');
+    // const http = require('http');
 
     return new Promise((resolve) => {
       const defaultStats = { inbound: 0, outbound: 0, transit: 0 };

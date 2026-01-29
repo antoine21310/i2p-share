@@ -1,28 +1,42 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
-import path from 'path';
+import type { BrowserWindow as BrowserWindowType } from 'electron';
 import Store from 'electron-store';
-import { initDatabase, closeDatabase, FileOps, SharedFolderOps, PeerOps, RemoteFileOps } from './database';
-import { fileIndexer } from './file-indexer';
-import { dhtSearch } from './dht-search';
-import { streamingClient } from './streaming-client';
-import { streamingServer } from './streaming-server';
-import { i2pConnection } from './i2p-connection';
-import { i2pdManager } from './i2pd-manager';
-import { trackerClient } from './tracker-client';
-import type { SearchFilters, NetworkStats, SearchResult } from '../shared/types';
+import path from 'path';
+import type { SearchFilters, SearchResult } from '../shared/types.js';
+import {
+    closeDatabase,
+    initDatabase,
+    PeerOps,
+    RemoteFileOps,
+    RoutingOps,
+    TorrentOps
+} from './database.js';
+import { dhtSearch } from './dht-search.js';
+import { FileIndexer } from './file-indexer.js';
+import { i2pConnection } from './i2p-connection.js';
+import { i2pdManager } from './i2pd-manager.js';
+import { EmbeddedTracker, getEmbeddedTracker } from './torrent/embedded-tracker.js';
+import { getTorrentManager, TorrentManager } from './torrent/torrent-manager.js';
+
+// Get electron from global (set by bootstrap.cjs)
+const electron = (globalThis as any).__electron;
+const { app, BrowserWindow, dialog, ipcMain, shell } = electron;
 
 // Configuration store
 const store = new Store({
   defaults: {
-    trackerAddresses: [] as string[], // List of tracker addresses for redundancy
-    displayName: 'I2P Share User' // User's display name visible to other peers
+    displayName: 'I2P Share User', // User's display name visible to other peers
   }
 });
 
-let mainWindow: BrowserWindow | null = null;
-let connectionStatus: 'disconnected' | 'downloading' | 'starting' | 'connecting' | 'connected' | 'error' = 'disconnected';
+let mainWindow: BrowserWindowType | null = null;
+let connectionStatus: string = 'disconnected';
 let connectionError: string = '';
 let downloadProgress: number = 0;
+
+// Torrent system
+let torrentManager: TorrentManager | null = null;
+let embeddedTracker: EmbeddedTracker | null = null;
+const fileIndexer = new FileIndexer();
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -34,19 +48,19 @@ function createWindow(): void {
     titleBarStyle: 'hiddenInset',
     frame: process.platform === 'darwin' ? true : false,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: true
+      sandbox: false
     }
   });
 
-  // Load the built files
-  mainWindow.loadFile(path.join(__dirname, '../../renderer/index.html'));
-
-  // Open DevTools in development
+  // Load the app - use Vite dev server in development, built files in production
   if (process.env.NODE_ENV === 'development') {
+    mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
 
   mainWindow.on('closed', () => {
@@ -70,17 +84,6 @@ function setupIPC(): void {
       addedAt: f.sharedAt
     }));
 
-    // Search remote files from peers (cached in database)
-    const remoteResults = RemoteFileOps.search(query).map((f: any) => ({
-      filename: f.filename,
-      fileHash: f.hash,
-      size: f.size,
-      mimeType: f.mimeType,
-      peerId: f.peerId,
-      peerDisplayName: f.peerName || 'Unknown Peer',
-      addedAt: f.lastUpdated
-    }));
-
     // DHT search for remote peers (only if connected to I2P)
     let dhtResults: SearchResult[] = [];
     if (i2pConnection.isReady()) {
@@ -93,17 +96,11 @@ function setupIPC(): void {
       console.log('[IPC] Skipping DHT search - not connected to I2P');
     }
 
-    // Deduplicate by fileHash (prefer local > remote > DHT)
+    // Deduplicate by fileHash (prefer local > DHT)
     const seen = new Set<string>();
     const results: SearchResult[] = [];
 
     for (const r of localResults) {
-      if (!seen.has(r.fileHash)) {
-        seen.add(r.fileHash);
-        results.push(r);
-      }
-    }
-    for (const r of remoteResults) {
       if (!seen.has(r.fileHash)) {
         seen.add(r.fileHash);
         results.push(r);
@@ -116,51 +113,51 @@ function setupIPC(): void {
       }
     }
 
-    console.log(`[IPC] Search results: ${localResults.length} local, ${remoteResults.length} remote, ${dhtResults.length} DHT`);
+    console.log(`[IPC] Search results: ${localResults.length} local, ${dhtResults.length} DHT`);
     return results;
   });
 
-  // Downloads - use streaming client for reliable transfers
-  // peerId can be either the datagram destination or the streaming destination
+  // Downloads - use TorrentManager for BitTorrent-based transfers
   ipcMain.handle('download:start', async (_event, fileHash: string, peerId: string, filename: string, size: number, peerName: string, streamingDest?: string) => {
     if (!i2pConnection.isReady()) {
       throw new Error('Not connected to I2P network');
     }
 
-    const displayName = peerName || 'Unknown Peer';
-    // Prefer streaming destination if available, fall back to regular peerId
-    const targetDest = streamingDest || peerId;
-    return streamingClient.addDownload(filename, fileHash, targetDest, displayName, size);
+    // If this is an infoHash (40 hex chars), use torrent system
+    if (fileHash.length === 40 && /^[0-9a-fA-F]+$/.test(fileHash) && torrentManager) {
+      // Add peer to torrent if it exists
+      const targetDest = streamingDest || peerId;
+      const added = await torrentManager.addPeer(fileHash, targetDest);
+      if (added) {
+        console.log(`[Main] Added peer to torrent ${fileHash.substring(0, 16)}...`);
+      }
+      return { infoHash: fileHash, name: filename };
+    }
+
+    throw new Error('Only .torrent files or magnet links are supported for downloads');
   });
 
-  ipcMain.handle('download:pause', async (_event, downloadId: number) => {
-    streamingClient.pauseDownload(downloadId);
+  ipcMain.handle('download:pause', async (_event, downloadId: string) => {
+    if (torrentManager) {
+      await torrentManager.pauseTorrent(downloadId);
+    }
   });
 
-  ipcMain.handle('download:resume', async (_event, downloadId: number) => {
-    streamingClient.resumeDownload(downloadId);
+  ipcMain.handle('download:resume', async (_event, downloadId: string) => {
+    if (torrentManager) {
+      await torrentManager.resumeTorrent(downloadId);
+    }
   });
 
-  ipcMain.handle('download:cancel', async (_event, downloadId: number) => {
-    streamingClient.cancelDownload(downloadId);
+  ipcMain.handle('download:cancel', async (_event, downloadId: string) => {
+    if (torrentManager) {
+      await torrentManager.removeTorrent(downloadId, false);
+    }
   });
 
   ipcMain.handle('download:list', async () => {
-    return streamingClient.getDownloads();
-  });
-
-  // Active uploads (files being downloaded by other peers)
-  ipcMain.handle('uploads:active', async () => {
-    const sessions = streamingServer.getActiveSessions();
-    return sessions.map(s => ({
-      sessionId: s.clientId,
-      filename: s.filename,
-      totalSize: s.totalSize,
-      bytesSent: s.bytesSent,
-      speed: s.speed,
-      progress: s.totalSize > 0 ? (s.bytesSent / s.totalSize) * 100 : 0,
-      isPaused: s.isPaused
-    }));
+    if (!torrentManager) return [];
+    return torrentManager.listTorrents();
   });
 
   // Shares
@@ -174,9 +171,6 @@ function setupIPC(): void {
       await fileIndexer.addFolder(folderPath);
       return {
         path: folderPath,
-        filesCount: 0,
-        totalSize: 0,
-        isScanning: true
       };
     }
     return null;
@@ -198,12 +192,104 @@ function setupIPC(): void {
     await fileIndexer.scanFolder(folderPath);
   });
 
+  // Torrent operations
+  ipcMain.handle('torrent:add', async (_event, torrentData: Buffer) => {
+    if (!torrentManager) {
+      throw new Error('Torrent manager not initialized');
+    }
+    return torrentManager.addTorrent(torrentData);
+  });
+
+  ipcMain.handle('torrent:addMagnet', async (_event, magnetUri: string) => {
+    if (!torrentManager) {
+      throw new Error('Torrent manager not initialized');
+    }
+    return torrentManager.addMagnet(magnetUri);
+  });
+
+  ipcMain.handle('torrent:create', async (_event, filePath: string, options?: { name?: string; trackers?: string[] }) => {
+    if (!torrentManager) {
+      throw new Error('Torrent manager not initialized');
+    }
+    return torrentManager.createTorrent(filePath, options);
+  });
+
+  ipcMain.handle('torrent:status', async (_event, infoHash: string) => {
+    if (!torrentManager) return null;
+    return torrentManager.getStatus(infoHash);
+  });
+
+  ipcMain.handle('torrent:list', async () => {
+    if (!torrentManager) return [];
+    return torrentManager.listTorrents();
+  });
+
+  ipcMain.handle('torrent:remove', async (_event, infoHash: string, deleteFiles?: boolean) => {
+    if (!torrentManager) {
+      throw new Error('Torrent manager not initialized');
+    }
+    await torrentManager.removeTorrent(infoHash, deleteFiles || false);
+    return { success: true };
+  });
+
+  ipcMain.handle('torrent:pause', async (_event, infoHash: string) => {
+    if (!torrentManager) {
+      throw new Error('Torrent manager not initialized');
+    }
+    await torrentManager.pauseTorrent(infoHash);
+    return { success: true };
+  });
+
+  ipcMain.handle('torrent:resume', async (_event, infoHash: string) => {
+    if (!torrentManager) {
+      throw new Error('Torrent manager not initialized');
+    }
+    await torrentManager.resumeTorrent(infoHash);
+    return { success: true };
+  });
+
+  ipcMain.handle('torrent:addPeer', async (_event, infoHash: string, destination: string) => {
+    if (!torrentManager) return false;
+    return torrentManager.addPeer(infoHash, destination);
+  });
+
+  ipcMain.handle('torrent:globalStats', async () => {
+    if (!torrentManager) {
+      return { totalDownloadSpeed: 0, totalUploadSpeed: 0, activeTorrents: 0, totalPeers: 0 };
+    }
+    return torrentManager.getGlobalStats();
+  });
+
+  // Add torrent file via dialog
+  ipcMain.handle('torrent:addFile', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      properties: ['openFile'],
+      filters: [{ name: 'Torrent Files', extensions: ['torrent'] }]
+    });
+
+    if (!result.canceled && result.filePaths.length > 0) {
+      const fs = await import('fs');
+      const torrentData = fs.readFileSync(result.filePaths[0]);
+      if (!torrentManager) {
+        throw new Error('Torrent manager not initialized');
+      }
+      return torrentManager.addTorrent(torrentData);
+    }
+    return null;
+  });
+
   // Network
-  ipcMain.handle('network:status', async (): Promise<NetworkStats & { statusText: string }> => {
+  ipcMain.handle('network:status', async () => {
     const dhtStats = dhtSearch.getStats();
-    const uploadStats = streamingServer.getStats();
-    const activeDownloads = streamingClient.getActiveDownloads();
     const i2pState = i2pConnection.getState();
+
+    // Get torrent stats
+    const torrentStats = torrentManager?.getGlobalStats() || {
+      totalDownloadSpeed: 0,
+      totalUploadSpeed: 0,
+      activeTorrents: 0,
+      totalPeers: 0
+    };
 
     let statusText = '';
     switch (connectionStatus) {
@@ -227,18 +313,15 @@ function setupIPC(): void {
         break;
     }
 
-    // Use tracker peers count as the primary source (these are actually online)
-    const trackerPeersCount = trackerClient.getPeersCount();
-
     // Get real tunnel count from i2pd (or default to 0)
     const activeTunnels = i2pState.isConnected ? await i2pdManager.getActiveTunnelCount() : 0;
 
     return {
       isConnected: connectionStatus === 'connected',
       activeTunnels,
-      peersConnected: trackerPeersCount, // Only count actual online peers from tracker
-      uploadSpeed: uploadStats.totalSpeed,
-      downloadSpeed: activeDownloads.reduce((sum, d) => sum + d.speed, 0),
+      peersConnected: torrentStats.totalPeers,
+      uploadSpeed: torrentStats.totalUploadSpeed,
+      downloadSpeed: torrentStats.totalDownloadSpeed,
       totalUploaded: 0,
       totalDownloaded: 0,
       statusText
@@ -275,27 +358,48 @@ function setupIPC(): void {
           await i2pConnection.sendMessage(dest, message);
         });
 
-        // Start streaming server for reliable file transfers
-        console.log('[Main] Starting streaming server...');
+        // Initialize TorrentManager for BitTorrent transfers
+        console.log('[Main] Initializing TorrentManager...');
         try {
-          const streamingDest = await streamingServer.start();
-          console.log('[Main] Streaming server started');
-          // Set streaming destination for tracker announcements
-          trackerClient.setStreamingDestination(streamingDest);
+          torrentManager = getTorrentManager();
+          await torrentManager.initialize();
+
+          // Configure with our destination and DHT
+          torrentManager.setLocalDestination(result.destination);
+          torrentManager.setDHTEngine(dhtSearch);
+
+          console.log('[Main] TorrentManager initialized');
+
+          // Set up torrent event forwarding
+          setupTorrentEvents();
         } catch (err: any) {
-          console.error('[Main] Failed to start streaming server:', err.message);
+          console.error('[Main] Failed to initialize TorrentManager:', err.message);
         }
-        // Load pending downloads with auto-resume
-        streamingClient.loadFromDatabase(true);
 
-        // Connect to tracker for peer discovery
-        await connectToTracker(result.destination);
+        // Initialize embedded tracker if enabled
+        console.log('[Main] Initializing EmbeddedTracker...');
+        try {
+          embeddedTracker = getEmbeddedTracker({ enabled: true });
+          embeddedTracker.setDHTEngine(dhtSearch);
+          await embeddedTracker.start();
 
-        // Announce ourselves to the network
-        const files = fileIndexer.getAllFiles();
-        await dhtSearch.announceFiles(files);
+          // If embedded tracker started, add it to our trackers
+          const destinations = embeddedTracker.getDestinations();
+          if (destinations.peerDiscovery && torrentManager) {
+            torrentManager.addTracker(destinations.peerDiscovery);
+            console.log('[Main] Added embedded tracker to multi-tracker');
+          }
+        } catch (err: any) {
+          console.error('[Main] Failed to start EmbeddedTracker:', err.message);
+        }
 
-        mainWindow?.webContents.send('network:connected');
+        // Announce ourselves and our torrents to DHT
+        const activeTorrents = TorrentOps.getActive();
+        for (const t of activeTorrents) {
+            dhtSearch.announcePeer(t.infoHash);
+        }
+
+        mainWindow?.webContents.send('network:connected', { address: result.b32Address });
         return { success: true, address: result.b32Address };
       } else {
         connectionStatus = 'error';
@@ -324,46 +428,6 @@ function setupIPC(): void {
     mainWindow?.webContents.send('network:disconnected');
   });
 
-  // Peers
-  ipcMain.handle('peers:list', async () => {
-    // Return only online peers from the tracker (no database storage)
-    const trackerPeers = trackerClient.getPeers();
-
-    // Deduplicate by destination (use Map to keep only unique peers)
-    const uniquePeers = new Map<string, any>();
-    for (const peer of trackerPeers) {
-      // Use b32 address as key for deduplication
-      const key = peer.b32Address || peer.destination.substring(0, 50);
-      if (!uniquePeers.has(key)) {
-        uniquePeers.set(key, {
-          peerId: peer.destination,
-          displayName: peer.displayName || 'Unknown',
-          filesCount: peer.filesCount || 0,
-          totalSize: peer.totalSize || 0,
-          b32Address: peer.b32Address,
-          streamingDestination: peer.streamingDestination, // For I2P Streaming downloads
-          isOnline: true, // All tracker peers are online
-          lastSeen: Math.floor(Date.now() / 1000)
-        });
-      }
-    }
-
-    return Array.from(uniquePeers.values());
-  });
-
-  ipcMain.handle('peers:get-files', async (_event, peerId: string) => {
-    return RemoteFileOps.getByPeer(peerId);
-  });
-
-  ipcMain.handle('peers:request-files', async (_event, peerId: string) => {
-    await requestFilesFromPeer(peerId);
-    return { success: true };
-  });
-
-  ipcMain.handle('remote-files:all', async () => {
-    return RemoteFileOps.getAll();
-  });
-
   // Window controls
   ipcMain.handle('window:minimize', () => {
     mainWindow?.minimize();
@@ -390,57 +454,6 @@ function setupIPC(): void {
     shell.showItemInFolder(filePath);
   });
 
-  // Tracker configuration
-  ipcMain.handle('tracker:get-addresses', async () => {
-    return store.get('trackerAddresses', []);
-  });
-
-  ipcMain.handle('tracker:set-addresses', async (_event, addresses: string[]) => {
-    const validAddresses = addresses.filter(a => a && a.trim().length > 0);
-    store.set('trackerAddresses', validAddresses);
-    trackerClient.setTrackerAddresses(validAddresses);
-
-    // If already connected to I2P, reconnect to trackers
-    if (i2pConnection.isReady()) {
-      const state = i2pConnection.getState();
-      await connectToTracker(state.destination);
-    }
-
-    return { success: true };
-  });
-
-  ipcMain.handle('tracker:get-active', async () => {
-    return trackerClient.getActiveTracker();
-  });
-
-  ipcMain.handle('tracker:get-peers', async () => {
-    return trackerClient.getPeers();
-  });
-
-  ipcMain.handle('tracker:refresh', async () => {
-    await trackerClient.requestPeers();
-    return { success: true };
-  });
-
-  // Legacy single address support (for backwards compatibility)
-  ipcMain.handle('tracker:get-address', async () => {
-    const addresses = store.get('trackerAddresses', []) as string[];
-    return addresses.length > 0 ? addresses[0] : '';
-  });
-
-  ipcMain.handle('tracker:set-address', async (_event, address: string) => {
-    const addresses = address ? [address] : [];
-    store.set('trackerAddresses', addresses);
-    trackerClient.setTrackerAddresses(addresses);
-
-    if (i2pConnection.isReady()) {
-      const state = i2pConnection.getState();
-      await connectToTracker(state.destination);
-    }
-
-    return { success: true };
-  });
-
   // User profile settings
   ipcMain.handle('profile:get-display-name', async () => {
     return store.get('displayName', 'I2P Share User');
@@ -449,120 +462,212 @@ function setupIPC(): void {
   ipcMain.handle('profile:set-display-name', async (_event, name: string) => {
     const displayName = name.trim() || 'I2P Share User';
     store.set('displayName', displayName);
-    // Update tracker client with new display name
-    trackerClient.setDisplayName(displayName);
-    // Re-announce to tracker with new name if connected
+    // Update DHT with new display name
     if (i2pConnection.isReady()) {
-      trackerClient.announce();
+      dhtSearch.setIdentity(i2pConnection.getState().destination, displayName);
     }
     return { success: true };
   });
-}
 
-async function connectToTracker(myDestination: string): Promise<void> {
-  const trackerAddresses = store.get('trackerAddresses', []) as string[];
-
-  if (trackerAddresses.length === 0) {
-    console.log('[Main] No tracker addresses configured - peer discovery disabled');
-    console.log('[Main] Configure tracker addresses in settings to discover peers');
-    return;
-  }
-
-  console.log(`[Main] Connecting to trackers (${trackerAddresses.length} configured)...`);
-  console.log(`[Main] My destination (first 50 chars): ${myDestination.substring(0, 50)}...`);
-  console.log(`[Main] Tracker address (first 50 chars): ${trackerAddresses[0]?.substring(0, 50)}...`);
-
-  // Set up tracker client with all addresses
-  trackerClient.setTrackerAddresses(trackerAddresses);
-  const storedDisplayName = store.get('displayName', 'I2P Share User') as string;
-  trackerClient.setIdentity(myDestination, storedDisplayName);
-  trackerClient.setMessageHandler(async (dest, msg) => {
-    console.log(`[Main] Sending message to ${dest.substring(0, 30)}...: ${msg.type}`);
-    const result = await i2pConnection.sendMessage(dest, msg);
-    console.log(`[Main] Send result: ${result}`);
-    return result;
+  // ==================== PEERS ====================
+  ipcMain.handle('peers:list', async () => {
+    return PeerOps.getAll();
   });
 
-  // Update stats
-  const files = fileIndexer.getAllFiles();
-  trackerClient.updateStats(files.length, files.reduce((sum, f: any) => sum + f.size, 0));
+  ipcMain.handle('peers:get-files', async (_event, peerId: string) => {
+    // Get files shared by a specific peer from database
+    return RemoteFileOps.getByPeer(peerId);
+  });
 
-  // Connect to a random tracker
-  const connected = await trackerClient.connect();
+  ipcMain.handle('peers:request-files', async (_event, peerId: string) => {
+    // Request file list from a peer via DHT search
+    if (!i2pConnection.isReady()) {
+      return { success: false, error: 'Not connected to I2P' };
+    }
+    try {
+      // Trigger a search to refresh peer data from the network
+      await dhtSearch.search('*', {}, 5000);
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
 
-  if (connected) {
-    const activeTracker = trackerClient.getActiveTracker();
-    console.log('[Main] Connected to tracker:', activeTracker?.substring(0, 20) + '...');
-  } else {
-    console.log('[Main] Failed to connect to any tracker');
-  }
+  ipcMain.handle('remote-files:all', async () => {
+    // Get all files from all known remote peers from database
+    return RemoteFileOps.getAll();
+  });
+
+  // ==================== TRACKER ====================
+  ipcMain.handle('tracker:get-addresses', async () => {
+    return store.get('trackerAddresses', []) as string[];
+  });
+
+  ipcMain.handle('tracker:set-addresses', async (_event, addresses: string[]) => {
+    store.set('trackerAddresses', addresses);
+    // Update torrent manager with new trackers
+    if (torrentManager) {
+      for (const addr of addresses) {
+        torrentManager.addTracker(addr);
+      }
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle('tracker:get-active', async () => {
+    // Return the first configured tracker or embedded tracker
+    const addresses = store.get('trackerAddresses', []) as string[];
+    if (addresses.length > 0) {
+      return addresses[0];
+    }
+    if (embeddedTracker) {
+      const dests = embeddedTracker.getDestinations();
+      return dests.peerDiscovery || null;
+    }
+    return null;
+  });
+
+  ipcMain.handle('tracker:get-peers', async () => {
+    // Get peers from database
+    return PeerOps.getAll();
+  });
+
+  ipcMain.handle('tracker:refresh', async () => {
+    // Trigger a DHT refresh/bootstrap
+    if (!i2pConnection.isReady()) {
+      return { success: false, error: 'Not connected to I2P' };
+    }
+    try {
+      // Get known nodes from routing table and bootstrap
+      const nodes = RoutingOps.getClosest('', 20) as any[];
+      const bootstrapNodes = nodes.map(n => ({
+        nodeId: n.nodeId,
+        destination: n.destination
+      }));
+      await dhtSearch.bootstrap(bootstrapNodes);
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Legacy single address (backwards compat)
+  ipcMain.handle('tracker:get-address', async () => {
+    const addresses = store.get('trackerAddresses', []) as string[];
+    return addresses[0] || '';
+  });
+
+  ipcMain.handle('tracker:set-address', async (_event, address: string) => {
+    const addresses = address ? [address] : [];
+    store.set('trackerAddresses', addresses);
+    if (torrentManager && address) {
+      torrentManager.addTracker(address);
+    }
+    return { success: true };
+  });
+
+  // ==================== EMBEDDED TRACKER ====================
+  ipcMain.handle('embedded-tracker:get-enabled', async () => {
+    return store.get('embeddedTrackerEnabled', true) as boolean;
+  });
+
+  ipcMain.handle('embedded-tracker:set-enabled', async (_event, enabled: boolean) => {
+    store.set('embeddedTrackerEnabled', enabled);
+    if (enabled && !embeddedTracker) {
+      // Start embedded tracker
+      try {
+        embeddedTracker = getEmbeddedTracker({ enabled: true });
+        embeddedTracker.setDHTEngine(dhtSearch);
+        await embeddedTracker.start();
+      } catch (err: any) {
+        console.error('[Main] Failed to start EmbeddedTracker:', err.message);
+        return { success: false, error: err.message };
+      }
+    } else if (!enabled && embeddedTracker) {
+      // Stop embedded tracker
+      await embeddedTracker.cleanup();
+      embeddedTracker = null;
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle('embedded-tracker:get-status', async () => {
+    if (!embeddedTracker) {
+      return {
+        isRunning: false,
+        b32Address: null,
+        btTrackerB32: null,
+        peersCount: 0,
+        torrentsCount: 0,
+        uptime: 0
+      };
+    }
+    const stats = embeddedTracker.getStats();
+    const destinations = embeddedTracker.getDestinations();
+    return {
+      isRunning: stats.isRunning,
+      b32Address: destinations.peerDiscoveryB32 || null,
+      btTrackerB32: destinations.btTrackerB32 || null,
+      peersCount: stats.peersCount || 0,
+      torrentsCount: stats.torrentsCount || 0,
+      uptime: stats.uptime || 0
+    };
+  });
+
+  // ==================== UPLOADS ====================
+  ipcMain.handle('uploads:active', async () => {
+    if (!torrentManager) return [];
+    // Return torrents that are seeding (complete and uploading)
+    const torrents = torrentManager.listTorrents();
+    return torrents.filter((t: any) => t.progress === 1 && t.uploadSpeed > 0);
+  });
 }
 
-// P2P file exchange protocol
-function handleP2PMessage(from: string, message: any): boolean {
-  if (!message || !message.type) return false;
+/**
+ * Set up TorrentManager event forwarding to renderer
+ */
+function setupTorrentEvents(): void {
+  if (!torrentManager) return;
 
-  switch (message.type) {
-    case 'GET_FILES':
-      handleGetFilesRequest(from);
-      return true;
-    case 'FILES_LIST':
-      handleFilesListResponse(from, message.payload);
-      return true;
-    default:
-      return false;
-  }
-}
+  torrentManager.on('torrent-added', (infoHash, name) => {
+    console.log(`[Main] Torrent added: ${name} (${infoHash.substring(0, 16)}...)`);
+    mainWindow?.webContents.send('torrent:added', { infoHash, name });
+  });
 
-function handleGetFilesRequest(from: string): void {
-  console.log(`[P2P] Received GET_FILES request from ${from.substring(0, 30)}...`);
+  torrentManager.on('torrent-removed', (infoHash) => {
+    console.log(`[Main] Torrent removed: ${infoHash.substring(0, 16)}...`);
+    mainWindow?.webContents.send('torrent:removed', { infoHash });
+  });
 
-  // Get our shared files
-  const files = fileIndexer.getAllFiles();
-  const filesList = files.map((f: any) => ({
-    filename: f.filename,
-    hash: f.hash,
-    size: f.size,
-    mimeType: f.mimeType
-  }));
+  torrentManager.on('torrent-started', (infoHash) => {
+    mainWindow?.webContents.send('torrent:started', { infoHash });
+  });
 
-  // Send response
-  const response = {
-    type: 'FILES_LIST',
-    payload: { files: filesList },
-    timestamp: Date.now()
-  };
+  torrentManager.on('torrent-stopped', (infoHash) => {
+    mainWindow?.webContents.send('torrent:stopped', { infoHash });
+  });
 
-  i2pConnection.sendMessage(from, response);
-  console.log(`[P2P] Sent FILES_LIST with ${filesList.length} files to ${from.substring(0, 30)}...`);
-}
+  torrentManager.on('torrent-complete', (infoHash) => {
+    console.log(`[Main] Torrent complete: ${infoHash.substring(0, 16)}...`);
+    mainWindow?.webContents.send('torrent:complete', { infoHash });
+    // Also send as download:completed for compatibility
+    mainWindow?.webContents.send('download:completed', { infoHash });
+  });
 
-function handleFilesListResponse(from: string, payload: any): void {
-  const files = payload?.files || [];
-  console.log(`[P2P] Received FILES_LIST with ${files.length} files from ${from.substring(0, 30)}...`);
+  torrentManager.on('torrent-error', (infoHash, error) => {
+    console.error(`[Main] Torrent error (${infoHash.substring(0, 16)}...):`, error.message);
+    mainWindow?.webContents.send('torrent:error', { infoHash, error: error.message });
+  });
 
-  if (files.length === 0) return;
+  torrentManager.on('progress', (infoHash, progress) => {
+    mainWindow?.webContents.send('torrent:progress', { infoHash, progress });
+    // Also send as download:progress for compatibility
+    mainWindow?.webContents.send('download:progress', { infoHash, progress });
+  });
 
-  // Save to database
-  RemoteFileOps.upsertBatch(from, files);
-  console.log(`[P2P] Saved ${files.length} remote files to database`);
-
-  // Notify UI
-  mainWindow?.webContents.send('remote-files:updated', { peerId: from, files });
-}
-
-async function requestFilesFromPeer(peerDestination: string): Promise<void> {
-  if (!i2pConnection.isReady()) return;
-
-  console.log(`[P2P] Requesting files from peer ${peerDestination.substring(0, 30)}...`);
-
-  const message = {
-    type: 'GET_FILES',
-    payload: {},
-    timestamp: Date.now()
-  };
-
-  await i2pConnection.sendMessage(peerDestination, message);
+  torrentManager.on('stats', (stats) => {
+    mainWindow?.webContents.send('torrent:stats', stats);
+  });
 }
 
 function setupEventForwarding(): void {
@@ -585,47 +690,7 @@ function setupEventForwarding(): void {
     }
   });
 
-  // Forward download events
-  streamingClient.on('download:added', (data) => {
-    mainWindow?.webContents.send('download:added', data);
-  });
-
-  streamingClient.on('download:started', (data) => {
-    mainWindow?.webContents.send('download:started', data);
-  });
-
-  streamingClient.on('download:progress', (data) => {
-    mainWindow?.webContents.send('download:progress', data);
-  });
-
-  streamingClient.on('download:completed', (data) => {
-    mainWindow?.webContents.send('download:completed', data);
-  });
-
-  streamingClient.on('download:failed', (data) => {
-    mainWindow?.webContents.send('download:failed', data);
-  });
-
-  streamingClient.on('download:paused', (data) => {
-    mainWindow?.webContents.send('download:paused', data);
-  });
-
-  streamingClient.on('download:resumed', (data) => {
-    mainWindow?.webContents.send('download:resumed', data);
-  });
-
-  // Forward upload events from streaming server
-  streamingServer.on('upload:start', (data) => {
-    mainWindow?.webContents.send('upload:start', data);
-  });
-
-  streamingServer.on('upload:progress', (data) => {
-    mainWindow?.webContents.send('upload:progress', data);
-  });
-
-  streamingServer.on('upload:complete', (data) => {
-    mainWindow?.webContents.send('upload:complete', data);
-  });
+  // Note: Torrent events are set up in setupTorrentEvents() after TorrentManager initialization
 
   // Forward DHT events
   dhtSearch.on('search:result', (data) => {
@@ -641,53 +706,6 @@ function setupEventForwarding(): void {
       filesCount: data.announce.filesCount,
       totalSize: data.announce.totalSize
     });
-  });
-
-  // Forward tracker client events - save discovered peers to database
-  // NOTE: These are the main handlers, don't duplicate below
-  trackerClient.on('peer:discovered', (peer) => {
-    console.log(`[Main] Tracker discovered peer: ${peer.displayName} (${peer.b32Address.substring(0, 16)}...)`);
-
-    // Save to database
-    PeerOps.upsert({
-      peerId: peer.destination,
-      displayName: peer.displayName,
-      filesCount: peer.filesCount,
-      totalSize: peer.totalSize
-    });
-
-    // Add to DHT routing table for future communication
-    const crypto = require('crypto');
-    const nodeId = crypto.createHash('sha1').update(peer.destination).digest('hex');
-    dhtSearch.updateNode(nodeId, peer.destination);
-
-    mainWindow?.webContents.send('peer:discovered', peer);
-
-    // Request files from this new peer (with small delay to let connection stabilize)
-    setTimeout(() => requestFilesFromPeer(peer.destination), 500);
-  });
-
-  trackerClient.on('peers:updated', (peers) => {
-    console.log(`[Main] Tracker peers updated: ${peers.length} peers`);
-    // Update all peers in database and request files
-    for (const peer of peers) {
-      PeerOps.upsert({
-        peerId: peer.destination,
-        displayName: peer.displayName,
-        filesCount: peer.filesCount,
-        totalSize: peer.totalSize
-      });
-
-      // Add to DHT routing table
-      const crypto = require('crypto');
-      const nodeId = crypto.createHash('sha1').update(peer.destination).digest('hex');
-      dhtSearch.updateNode(nodeId, peer.destination);
-
-      // Request files from each peer (will get fresh list)
-      setTimeout(() => requestFilesFromPeer(peer.destination), 500);
-    }
-    mainWindow?.webContents.send('peers:updated', peers);
-    mainWindow?.webContents.send('tracker:peers-updated', peers);
   });
 
   // Forward I2P connection events
@@ -712,29 +730,11 @@ function setupEventForwarding(): void {
 
   i2pConnection.on('message', ({ from, message }) => {
     // Log ALL incoming messages for debugging
-    const fromShort = from.substring(0, 30);
-    console.log(`[Main] Received message type=${message?.type} from ${fromShort}...`);
-
-    // First check if it's a tracker message
-    const isTrackerMessage = trackerClient.handleMessage(from, message);
-    if (isTrackerMessage) {
-      console.log(`[Main] -> Handled as tracker message`);
-      return;
+    // Route to DHT handler
+    if (dhtSearch) {
+        dhtSearch.handleMessage(from, message);
     }
-
-    // Check if it's a P2P file exchange message
-    const isP2PMessage = handleP2PMessage(from, message);
-    if (isP2PMessage) {
-      console.log(`[Main] -> Handled as P2P message`);
-      return;
-    }
-
-    // Otherwise route to DHT handler
-    console.log(`[Main] -> Routing to DHT handler`);
-    dhtSearch.handleMessage(from, message);
   });
-
-  // Note: tracker event handlers are defined above, no duplicates needed here
 
   // Forward i2pd manager events
   i2pdManager.on('state', (state) => {
@@ -784,26 +784,46 @@ async function startI2PAndConnect(): Promise<void> {
       connectionStatus = 'connected';
 
       // Initialize DHT
-      dhtSearch.setIdentity(result.destination, result.destination);
+      const storedDisplayName = store.get('displayName', 'I2P Share User') as string;
+      dhtSearch.setIdentity(result.destination, storedDisplayName);
       dhtSearch.setMessageHandler(async (dest, message) => {
         await i2pConnection.sendMessage(dest, message);
       });
 
-      // Start streaming server for reliable file transfers
-      console.log('[Main] Starting streaming server...');
+      // Initialize TorrentManager for BitTorrent transfers
+      console.log('[Main] Initializing TorrentManager...');
       try {
-        const streamingDest = await streamingServer.start();
-        console.log('[Main] Streaming server started');
-        // Set streaming destination for tracker announcements
-        trackerClient.setStreamingDestination(streamingDest);
-      } catch (err: any) {
-        console.error('[Main] Failed to start streaming server:', err.message);
-      }
-      // Load pending downloads with auto-resume
-      streamingClient.loadFromDatabase(true);
+        torrentManager = getTorrentManager();
+        await torrentManager.initialize();
 
-      // Connect to tracker for peer discovery
-      await connectToTracker(result.destination);
+        // Configure multi-tracker with our destination and DHT
+        torrentManager.setLocalDestination(result.destination);
+        torrentManager.setDHTEngine(dhtSearch);
+
+        console.log('[Main] TorrentManager initialized');
+
+        // Set up torrent event forwarding
+        setupTorrentEvents();
+      } catch (err: any) {
+        console.error('[Main] Failed to initialize TorrentManager:', err.message);
+      }
+
+      // Initialize embedded tracker if enabled
+      console.log('[Main] Initializing EmbeddedTracker...');
+      try {
+        embeddedTracker = getEmbeddedTracker({ enabled: true });
+        embeddedTracker.setDHTEngine(dhtSearch);
+        await embeddedTracker.start();
+
+        // If embedded tracker started, add it to our trackers
+        const destinations = embeddedTracker.getDestinations();
+        if (destinations.peerDiscovery && torrentManager) {
+          torrentManager.addTracker(destinations.peerDiscovery);
+          console.log('[Main] Added embedded tracker to multi-tracker');
+        }
+      } catch (err: any) {
+        console.error('[Main] Failed to start EmbeddedTracker:', err.message);
+      }
 
       mainWindow?.webContents.send('network:connected', {
         address: result.b32Address
@@ -826,6 +846,25 @@ async function startI2PAndConnect(): Promise<void> {
       error: connectionError
     });
   }
+
+  i2pConnection.on('status', (status) => {
+    connectionStatus = status;
+    let statusText = status;
+
+    // Improved UX messages for I2P latency
+    switch (status) {
+      case 'starting': statusText = 'Starting I2P Node...'; break;
+      case 'connecting': statusText = 'Building Tunnels (may take 1-3 mins)...'; break;
+      case 'connected': statusText = 'I2P Network Connected'; break;
+      case 'error': statusText = 'Connection Error'; break;
+    }
+
+    mainWindow?.webContents.send('network:status-change', {
+      status: connectionStatus,
+      text: statusText,
+      error: connectionError
+    });
+  });
 }
 
 app.whenReady().then(async () => {
@@ -837,7 +876,7 @@ app.whenReady().then(async () => {
 
   // Load saved data
   dhtSearch.loadFromDatabase();
-  // Note: streamingClient.loadFromDatabase() is called when I2P connects
+  // Note: TorrentManager.initialize() loads torrents from database when I2P connects
 
   // Setup IPC handlers
   setupIPC();
@@ -867,13 +906,17 @@ app.on('window-all-closed', () => {
 app.on('before-quit', async () => {
   console.log('[Main] Shutting down...');
 
-  // Stop streaming server
-  await streamingServer.stop();
+  // Shutdown TorrentManager
+  if (torrentManager) {
+    await torrentManager.shutdown();
+  }
 
-  // Notify tracker that we're disconnecting (so other peers are updated)
-  await trackerClient.disconnect();
+  // Shutdown EmbeddedTracker
+  if (embeddedTracker) {
+    await embeddedTracker.cleanup();
+  }
 
-  // Disconnect from I2P (but keep i2pd running for tracker)
+  // Disconnect from I2P (but keep i2pd running)
   await i2pConnection.disconnect();
 
   // Don't stop i2pd - keep it running so tracker can continue working

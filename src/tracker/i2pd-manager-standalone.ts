@@ -1,9 +1,10 @@
+import { ChildProcess, spawn } from 'child_process';
 import { EventEmitter } from 'events';
-import path from 'path';
-import fs from 'fs';
+import fs, { createWriteStream } from 'fs';
+import http from 'http';
 import https from 'https';
-import { spawn, ChildProcess } from 'child_process';
-import { createWriteStream } from 'fs';
+import net from 'net';
+import path from 'path';
 
 // i2pd release URLs for each platform
 const I2PD_VERSION = '2.54.0';
@@ -121,7 +122,7 @@ export class I2PDManagerStandalone extends EventEmitter {
           return;
         }
 
-        const protocol = downloadUrl.startsWith('https') ? https : require('http');
+        const protocol = downloadUrl.startsWith('https') ? https : http;
 
         protocol.get(downloadUrl, (response: any) => {
           // Handle redirects
@@ -296,7 +297,7 @@ enabled = true
 
   // Check if SAM bridge is already available
   async isSAMAvailable(): Promise<boolean> {
-    const net = require('net');
+    // const net = require('net');
     return new Promise((resolve) => {
       const socket = new net.Socket();
       socket.setTimeout(2000);
@@ -397,8 +398,7 @@ enabled = true
 
   private async waitForSAM(timeout = 60000): Promise<void> {
     const startTime = Date.now();
-    const net = require('net');
-
+    
     console.log('[I2PD] Waiting for SAM bridge...');
 
     while (Date.now() - startTime < timeout) {

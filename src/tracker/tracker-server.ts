@@ -1,15 +1,21 @@
+import { createForward, createLocalDestination, createRaw, toB32 } from '@diva.exchange/i2p-sam';
 import { EventEmitter } from 'events';
-import { createRaw, createLocalDestination, toB32 } from '@diva.exchange/i2p-sam';
-import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import {
-  generateSigningKeypair,
-  createSignedMessage,
-  verifySignedMessage,
-  SignedMessage,
-  SigningKeypair
-} from '../shared/utils';
+    createSignedMessage,
+    generateSigningKeypair,
+    SignedMessage,
+    SigningKeypair,
+    verifySignedMessage
+} from '../shared/utils.js';
+import {
+    BTAnnounceHandler,
+    createErrorHttpResponse,
+    parseAnnounceQuery
+} from './bt-announce-handler.js';
 
 interface Peer {
   destination: string;
@@ -31,6 +37,10 @@ interface TrackerConfig {
   cleanupInterval: number;
   dataDir: string; // Directory to store persistent data (keys)
   maxPeersPerResponse: number; // Pagination limit for large networks
+  /** Port for BEP3 HTTP tracker (streaming) */
+  httpTrackerPort: number;
+  /** Enable BEP3 BitTorrent tracker */
+  enableBTTracker: boolean;
 }
 
 interface TrackerMessage {
@@ -66,6 +76,13 @@ export class TrackerServer extends EventEmitter {
   private dbSaveTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts: number = 0;
 
+  // BEP3 BitTorrent HTTP Tracker
+  private btAnnounceHandler: BTAnnounceHandler | null = null;
+  private httpServer: net.Server | null = null;
+  private samForward: any = null;
+  private btTrackerDestination: string = '';
+  private btTrackerB32: string = '';
+
   constructor(config: Partial<TrackerConfig> = {}) {
     super();
     this.config = {
@@ -76,7 +93,9 @@ export class TrackerServer extends EventEmitter {
       peerTimeout: config.peerTimeout || 5 * 60 * 1000,
       cleanupInterval: config.cleanupInterval || 60 * 1000,
       dataDir: config.dataDir || './tracker-data',
-      maxPeersPerResponse: config.maxPeersPerResponse || 100 // Limit per response for large networks
+      maxPeersPerResponse: config.maxPeersPerResponse || 100, // Limit per response for large networks
+      httpTrackerPort: config.httpTrackerPort || 7680,
+      enableBTTracker: config.enableBTTracker ?? true
     };
   }
 
@@ -252,7 +271,7 @@ export class TrackerServer extends EventEmitter {
     }
   }
 
-  async start(): Promise<{ success: boolean; b32Address?: string; error?: string }> {
+  async start(): Promise<{ success: boolean; b32Address?: string; btTrackerDestination?: string; btTrackerB32?: string; error?: string }> {
     console.log('[Tracker] Starting tracker server...');
     console.log('[Tracker] SAM bridge:', `${this.config.samHost}:${this.config.samPortTCP}`);
     console.log('[Tracker] Data directory:', this.config.dataDir);
@@ -325,6 +344,11 @@ export class TrackerServer extends EventEmitter {
       // Create RAW session for datagram communication
       await this.createSamSession();
 
+      // Start BEP3 BitTorrent HTTP tracker if enabled
+      if (this.config.enableBTTracker) {
+        await this.startBTTracker();
+      }
+
       this.isRunning = true;
 
       // Start cleanup timer
@@ -349,7 +373,9 @@ export class TrackerServer extends EventEmitter {
 
       return {
         success: true,
-        b32Address: this.b32Address
+        b32Address: this.b32Address,
+        btTrackerDestination: this.btTrackerDestination || undefined,
+        btTrackerB32: this.btTrackerB32 || undefined
       };
 
     } catch (error: any) {
@@ -731,6 +757,9 @@ export class TrackerServer extends EventEmitter {
       this.sam = null;
     }
 
+    // Stop BT tracker
+    await this.stopBTTracker();
+
     // Save and close SQLite database
     if (this.db) {
       try {
@@ -754,5 +783,340 @@ export class TrackerServer extends EventEmitter {
    */
   getSigningPublicKey(): string | null {
     return this.signingKeys?.publicKey || null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BEP3 BitTorrent HTTP Tracker
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Start the BEP3 BitTorrent HTTP tracker
+   * Creates a local TCP server and forwards I2P streaming connections to it
+   */
+  private async startBTTracker(): Promise<void> {
+    console.log('[Tracker] Starting BEP3 BitTorrent HTTP tracker...');
+
+    // Initialize BTAnnounceHandler
+    this.btAnnounceHandler = new BTAnnounceHandler({
+      announceInterval: 1800,       // 30 minutes
+      minAnnounceInterval: 60,      // 1 minute
+      peerTimeout: this.config.peerTimeout,
+      maxPeersPerResponse: this.config.maxPeersPerResponse
+    });
+
+    // Create local TCP server for HTTP requests
+    const httpPort = this.config.httpTrackerPort + Math.floor(Math.random() * 100);
+
+    this.httpServer = net.createServer((socket) => {
+      this.handleBTConnection(socket);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      this.httpServer!.listen(httpPort, '127.0.0.1', () => {
+        console.log(`[Tracker] BT HTTP server listening on 127.0.0.1:${httpPort}`);
+        resolve();
+      });
+      this.httpServer!.on('error', reject);
+    });
+
+    // Create I2P streaming forward to the local HTTP server
+    try {
+      this.samForward = await createForward({
+        sam: {
+          host: this.config.samHost,
+          portTCP: this.config.samPortTCP
+        },
+        forward: {
+          host: '127.0.0.1',
+          port: httpPort
+        }
+      });
+
+      // Get the destination for the BT tracker
+      this.btTrackerDestination = this.samForward.getPublicKey();
+      this.btTrackerB32 = toB32(this.btTrackerDestination);
+
+      console.log('[Tracker] ════════════════════════════════════════════════════════');
+      console.log('[Tracker] BEP3 BITTORRENT TRACKER READY!');
+      console.log('[Tracker]');
+      console.log('[Tracker] BT Tracker B32 Address:');
+      console.log('[Tracker]   ' + this.btTrackerB32);
+      console.log('[Tracker]');
+      console.log('[Tracker] BT Tracker Destination (for .torrent files):');
+      console.log('[Tracker]   ' + this.btTrackerDestination);
+      console.log('[Tracker] ════════════════════════════════════════════════════════');
+
+      // Save BT tracker destination to file
+      const btDestFile = path.join(this.config.dataDir, 'bt-tracker-destination.txt');
+      fs.writeFileSync(btDestFile, this.btTrackerDestination);
+      console.log('[Tracker] BT Tracker destination saved to:', btDestFile);
+
+    } catch (error: any) {
+      console.error('[Tracker] Failed to create I2P forward for BT tracker:', error.message);
+      // Continue without BT tracker - the main tracker still works
+      if (this.httpServer) {
+        this.httpServer.close();
+        this.httpServer = null;
+      }
+    }
+  }
+
+  /**
+   * Handle incoming BT tracker HTTP connection
+   */
+  private handleBTConnection(socket: net.Socket): void {
+    let requestBuffer = Buffer.alloc(0);
+    const remoteAddress = socket.remoteAddress || 'unknown';
+
+    socket.on('data', (data) => {
+      requestBuffer = Buffer.concat([requestBuffer, data]);
+
+      // Check if we have a complete HTTP request
+      const requestStr = requestBuffer.toString('utf8');
+      const headerEnd = requestStr.indexOf('\r\n\r\n');
+
+      if (headerEnd === -1) {
+        // Not complete yet, wait for more data
+        if (requestBuffer.length > 65536) {
+          // Request too large
+          socket.write(createErrorHttpResponse(413, 'Request too large'));
+          socket.end();
+        }
+        return;
+      }
+
+      // Parse HTTP request
+      const headers = requestStr.substring(0, headerEnd);
+      const lines = headers.split('\r\n');
+      const requestLine = lines[0];
+
+      const match = requestLine.match(/^(GET|POST) ([^ ]+) HTTP\/\d\.\d$/);
+      if (!match) {
+        socket.write(createErrorHttpResponse(400, 'Bad Request'));
+        socket.end();
+        return;
+      }
+
+      const method = match[1];
+      const fullPath = match[2];
+
+      // Parse URL
+      const urlParts = fullPath.split('?');
+      const urlPath = urlParts[0];
+      const queryString = urlParts[1] || '';
+
+      console.log(`[Tracker] BT HTTP ${method} ${urlPath}`);
+
+      // Route request
+      if (urlPath === '/announce' || urlPath === '/announce.php') {
+        this.handleBTAnnounce(socket, queryString, remoteAddress);
+      } else if (urlPath === '/scrape' || urlPath === '/scrape.php') {
+        this.handleBTScrape(socket, queryString);
+      } else if (urlPath === '/stats' || urlPath === '/') {
+        this.handleBTStats(socket);
+      } else {
+        socket.write(createErrorHttpResponse(404, 'Not Found'));
+        socket.end();
+      }
+    });
+
+    socket.on('error', (error) => {
+      console.error('[Tracker] BT socket error:', error.message);
+    });
+
+    // Set timeout
+    socket.setTimeout(30000, () => {
+      socket.end();
+    });
+  }
+
+  /**
+   * Handle BEP3 announce request
+   */
+  private handleBTAnnounce(socket: net.Socket, queryString: string, requesterDest?: string): void {
+    if (!this.btAnnounceHandler) {
+      socket.write(createErrorHttpResponse(500, 'Tracker not initialized'));
+      socket.end();
+      return;
+    }
+
+    const params = parseAnnounceQuery(queryString);
+    if (!params) {
+      socket.write(createErrorHttpResponse(400, 'Invalid announce parameters'));
+      socket.end();
+      return;
+    }
+
+    try {
+      const responseBody = this.btAnnounceHandler.handleAnnounce(params, requesterDest);
+
+      // Build HTTP response
+      const headers = [
+        'HTTP/1.1 200 OK',
+        'Content-Type: text/plain',
+        `Content-Length: ${responseBody.length}`,
+        'Connection: close',
+        '',
+        ''
+      ].join('\r\n');
+
+      socket.write(headers);
+      socket.write(responseBody);
+      socket.end();
+
+    } catch (error: any) {
+      console.error('[Tracker] BT announce error:', error.message);
+      socket.write(createErrorHttpResponse(500, 'Internal error'));
+      socket.end();
+    }
+  }
+
+  /**
+   * Handle BEP3 scrape request
+   */
+  private handleBTScrape(socket: net.Socket, queryString: string): void {
+    if (!this.btAnnounceHandler) {
+      socket.write(createErrorHttpResponse(500, 'Tracker not initialized'));
+      socket.end();
+      return;
+    }
+
+    try {
+      // Parse info_hash parameters
+      const params = new URLSearchParams(queryString);
+      const infoHashes: string[] = [];
+
+      // Can have multiple info_hash params
+      const allParams = queryString.split('&');
+      for (const param of allParams) {
+        if (param.startsWith('info_hash=')) {
+          const encoded = param.substring(10);
+          const decoded = decodeURIComponent(encoded);
+          if (decoded.length === 20) {
+            infoHashes.push(Buffer.from(decoded, 'binary').toString('hex'));
+          } else if (decoded.length === 40 && /^[0-9a-fA-F]+$/.test(decoded)) {
+            infoHashes.push(decoded.toLowerCase());
+          }
+        }
+      }
+
+      if (infoHashes.length === 0) {
+        socket.write(createErrorHttpResponse(400, 'Missing info_hash'));
+        socket.end();
+        return;
+      }
+
+      const responseBody = this.btAnnounceHandler.handleScrape(infoHashes);
+
+      const headers = [
+        'HTTP/1.1 200 OK',
+        'Content-Type: text/plain',
+        `Content-Length: ${responseBody.length}`,
+        'Connection: close',
+        '',
+        ''
+      ].join('\r\n');
+
+      socket.write(headers);
+      socket.write(responseBody);
+      socket.end();
+
+    } catch (error: any) {
+      console.error('[Tracker] BT scrape error:', error.message);
+      socket.write(createErrorHttpResponse(500, 'Internal error'));
+      socket.end();
+    }
+  }
+
+  /**
+   * Handle tracker stats request (simple HTML page)
+   */
+  private handleBTStats(socket: net.Socket): void {
+    const stats = this.btAnnounceHandler?.getStatistics() || {
+      torrents: 0,
+      totalPeers: 0,
+      totalSeeders: 0,
+      totalLeechers: 0
+    };
+
+    const peerStats = this.getStats();
+
+    const html = `<!DOCTYPE html>
+<html>
+<head><title>I2P-Share Tracker</title></head>
+<body>
+<h1>I2P-Share Tracker</h1>
+<h2>Peer Discovery (Datagram)</h2>
+<p>Active peers: ${peerStats.peersCount}</p>
+<h2>BitTorrent Tracker (BEP3)</h2>
+<p>Tracked torrents: ${stats.torrents}</p>
+<p>Total peers: ${stats.totalPeers}</p>
+<p>Seeders: ${stats.totalSeeders}</p>
+<p>Leechers: ${stats.totalLeechers}</p>
+</body>
+</html>`;
+
+    const body = Buffer.from(html, 'utf8');
+    const headers = [
+      'HTTP/1.1 200 OK',
+      'Content-Type: text/html; charset=utf-8',
+      `Content-Length: ${body.length}`,
+      'Connection: close',
+      '',
+      ''
+    ].join('\r\n');
+
+    socket.write(headers);
+    socket.write(body);
+    socket.end();
+  }
+
+  /**
+   * Stop the BT tracker
+   */
+  private async stopBTTracker(): Promise<void> {
+    if (this.btAnnounceHandler) {
+      this.btAnnounceHandler.stop();
+      this.btAnnounceHandler = null;
+    }
+
+    if (this.httpServer) {
+      await new Promise<void>((resolve) => {
+        this.httpServer!.close(() => resolve());
+      });
+      this.httpServer = null;
+    }
+
+    if (this.samForward) {
+      try {
+        this.samForward.close();
+      } catch (e) {
+        // Ignore
+      }
+      this.samForward = null;
+    }
+
+    console.log('[Tracker] BT tracker stopped');
+  }
+
+  /**
+   * Get the BT tracker destination
+   */
+  getBTTrackerDestination(): string {
+    return this.btTrackerDestination;
+  }
+
+  /**
+   * Get the BT tracker B32 address
+   */
+  getBTTrackerB32(): string {
+    return this.btTrackerB32;
+  }
+
+  /**
+   * Get BT tracker statistics
+   */
+  getBTTrackerStats(): { torrents: number; totalPeers: number; totalSeeders: number; totalLeechers: number } | null {
+    return this.btAnnounceHandler?.getStatistics() || null;
   }
 }

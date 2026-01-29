@@ -1,5 +1,11 @@
+import { createLocalDestination, createRaw } from '@diva.exchange/i2p-sam';
 import { EventEmitter } from 'events';
-import { createRaw, createLocalDestination, toB32 } from '@diva.exchange/i2p-sam';
+
+// Get electron from global (set by bootstrap.cjs)
+const electron = (globalThis as any).__electron;
+const { app } = electron;
+import fs from 'fs';
+import path from 'path';
 
 interface I2PConfig {
   samHost: string;
@@ -39,25 +45,60 @@ export class I2PConnection extends EventEmitter {
     console.log('[I2P] Connecting to SAM bridge at', `${this.config.samHost}:${this.config.samPortTCP}`);
 
     try {
-      // First, create a local destination (keypair)
-      console.log('[I2P] Creating local destination...');
-      const destInfo = await createLocalDestination({
-        sam: {
-          host: this.config.samHost,
-          portTCP: this.config.samPortTCP
+      // Check for existing keys
+      const userDataPath = app?.getPath('userData') || process.cwd();
+      const keysPath = path.join(userDataPath, 'i2p-keys.json');
+      let keysLoaded = false;
+
+      if (fs.existsSync(keysPath)) {
+        try {
+          const savedKeys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
+          if (savedKeys.public && savedKeys.private && savedKeys.address) {
+            console.log('[I2P] Loading saved identity...');
+            this.publicKey = savedKeys.public;
+            this.privateKey = savedKeys.private;
+            this.destination = savedKeys.public; // In i2p-sam, public key is the destination
+            this.b32Address = savedKeys.address;
+            keysLoaded = true;
+          }
+        } catch (e) {
+          console.error('[I2P] Failed to load saved keys:', e);
         }
-      });
+      }
 
-      // Note: In i2p-sam library:
-      // - destInfo.public = full I2P destination (base64, ~400 chars)
-      // - destInfo.address = b32 address (short hash)
-      // We need the FULL destination for SAM communication
-      this.destination = destInfo.public;
-      this.publicKey = destInfo.public;
-      this.privateKey = destInfo.private;
-      this.b32Address = destInfo.address;
+      if (!keysLoaded) {
+        // First, create a local destination (keypair)
+        console.log('[I2P] Creating local destination...');
+        const destInfo = await createLocalDestination({
+          sam: {
+            host: this.config.samHost,
+            portTCP: this.config.samPortTCP
+          }
+        });
 
-      console.log('[I2P] Destination created:', this.b32Address);
+        // Note: In i2p-sam library:
+        // - destInfo.public = full I2P destination (base64, ~400 chars)
+        // - destInfo.address = b32 address (short hash)
+        // We need the FULL destination for SAM communication
+        this.destination = destInfo.public;
+        this.publicKey = destInfo.public;
+        this.privateKey = destInfo.private;
+        this.b32Address = destInfo.address;
+
+        // Save keys
+        try {
+          fs.writeFileSync(keysPath, JSON.stringify({
+            public: this.publicKey,
+            private: this.privateKey,
+            address: this.b32Address
+          }, null, 2));
+          console.log('[I2P] Identity saved to:', keysPath);
+        } catch (e) {
+          console.error('[I2P] Failed to save keys:', e);
+        }
+      }
+
+      console.log('[I2P] Destination ready:', this.b32Address);
 
       // Now create the RAW session for datagram communication
       console.log('[I2P] Creating RAW session...');

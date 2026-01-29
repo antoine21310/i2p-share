@@ -2,8 +2,9 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
-    "module": "CommonJS",
-    "moduleResolution": "node",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "composite": true,
     "outDir": "dist/main",
     "rootDir": "src",
     "strict": true,
@@ -11,12 +12,12 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "declaration": false,
+    "declaration": true,
     "sourceMap": true,
     "baseUrl": ".",
     "paths": {
       "@shared/*": ["src/shared/*"]
     }
   },
-  "include": ["src/main/**/*", "src/shared/**/*"]
+  "include": ["src/main/**/*", "src/shared/**/*", "src/tracker/**/*"]
 }
