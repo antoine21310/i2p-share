@@ -613,6 +613,7 @@ function setupIPC(): void {
         isRunning: false,
         b32Address: null,
         btTrackerB32: null,
+        destination: null,
         peersCount: 0,
         torrentsCount: 0,
         uptime: 0
@@ -624,6 +625,7 @@ function setupIPC(): void {
       isRunning: stats.isRunning,
       b32Address: destinations.peerDiscoveryB32 || null,
       btTrackerB32: destinations.btTrackerB32 || null,
+      destination: destinations.peerDiscovery || null,
       peersCount: stats.peersCount || 0,
       torrentsCount: stats.torrentsCount || 0,
       uptime: stats.uptime || 0

@@ -79,6 +79,7 @@ interface ElectronAPI {
     isRunning: boolean;
     b32Address: string | null;
     btTrackerB32: string | null;
+    destination: string | null;
     peersCount: number;
     torrentsCount: number;
     uptime: number;

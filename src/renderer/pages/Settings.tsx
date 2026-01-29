@@ -5,6 +5,7 @@ interface EmbeddedTrackerStatus {
   isRunning: boolean;
   b32Address: string | null;
   btTrackerB32: string | null;
+  destination: string | null;
   peersCount: number;
   torrentsCount: number;
   uptime: number;
@@ -337,19 +338,25 @@ export function SettingsPage() {
 
                     {embeddedTrackerStatus.b32Address && (
                       <div className="text-xs">
-                        <span className="text-dark-500">Peer Discovery:</span>
+                        <span className="text-dark-500">B32 Address:</span>
                         <code className="ml-2 text-primary-400 break-all">
-                          {embeddedTrackerStatus.b32Address.substring(0, 24)}...
+                          {embeddedTrackerStatus.b32Address}
                         </code>
                       </div>
                     )}
 
-                    {embeddedTrackerStatus.btTrackerB32 && (
-                      <div className="text-xs">
-                        <span className="text-dark-500">BT Tracker:</span>
-                        <code className="ml-2 text-primary-400 break-all">
-                          {embeddedTrackerStatus.btTrackerB32.substring(0, 24)}...
+                    {embeddedTrackerStatus.destination && (
+                      <div className="mt-3 p-3 bg-dark-700/50 rounded-lg border border-dark-600">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-medium text-dark-300">Share this address with others:</span>
+                          <CopyButton text={embeddedTrackerStatus.destination} />
+                        </div>
+                        <code className="block text-xs text-primary-400 break-all select-all bg-dark-800 p-2 rounded">
+                          {embeddedTrackerStatus.destination}
                         </code>
+                        <p className="text-xs text-dark-500 mt-2">
+                          Other users can paste this in Settings → Tracker Addresses to connect to your tracker.
+                        </p>
                       </div>
                     )}
                   </>
@@ -577,6 +584,53 @@ function Toggle({ checked, onChange }: ToggleProps) {
           ${checked ? 'translate-x-6' : 'translate-x-1'}
         `}
       />
+    </button>
+  );
+}
+
+interface CopyButtonProps {
+  text: string;
+}
+
+function CopyButton({ text }: CopyButtonProps) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      className={`
+        px-3 py-1 text-xs font-medium rounded transition-colors
+        ${copied
+          ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+          : 'bg-primary-500/20 text-primary-400 border border-primary-500/30 hover:bg-primary-500/30'
+        }
+      `}
+    >
+      {copied ? (
+        <span className="flex items-center gap-1">
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+          </svg>
+          Copied!
+        </span>
+      ) : (
+        <span className="flex items-center gap-1">
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+          </svg>
+          Copy
+        </span>
+      )}
     </button>
   );
 }
